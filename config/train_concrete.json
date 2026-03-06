@@ -22,14 +22,14 @@
         "segment_length": 132300,
         "train_dataset": {
             "speech": {
-                "vocal": "/root/autodl-tmp/Data/Train_set_speech/wav48/train",
-                "noise": "/root/autodl-tmp/Data/Train_set_noise/vd_noise"
+                "vocal": "/root/autodl-tmp/Train_set_speech/wav48/train",
+                "noise": "/root/autodl-tmp/Train_set_noise/vd_noise"
             }
         },
         "val_dataset": {
             "speech": {
-                "vocal": "/root/autodl-tmp/Data/Train_set_speech/wav48/test",
-                "noise": "/root/autodl-tmp/Data/Train_set_noise/vd_noise"
+                "vocal": "/root/autodl-tmp/Train_set_speech/wav48/test",
+                "noise": "/root/autodl-tmp/Train_set_noise/vd_noise"
             }
         }
     },
@@ -63,22 +63,25 @@
             "reverb": {"prob": 0.5}
         },
         "params": {
-            "rir_root": "/root/autodl-tmp/Data/Train_and_test_set_RIR/RIR_44k/train"
+            "rir_root": "/root/autodl-tmp/Train_and_test_set_RIR/RIR_44k/train"
         }
     },
 
     "train": {
-        "_doc": "父类 gsr_voicefixer.py L97-L104 硬读取全部以下字段",
+        "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
         "max_epoches": 500,
-        "batch_size": 24,
-        "accumulate_grad_batches": 1,
-        "learning_rate": 1e-5,
+        "batch_size": 32,
+        "accumulate_grad_batches": 3,
+        "learning_rate": 8e-5,
         "lr_decay": 0.999,
         "warmup_steps": 1000,
         "input_segment_length": 132300,
         "reduce_lr_every_n_steps": 5000,
-        "check_val_every_n_epoch": 1,
-        "num_workers": 12,
+        "check_val_every_n_epoch": 5,
+        "num_workers": 8,
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 3,
         "save_top_k": 3,
         "early_stop_patience": 25,
         "detect_anomaly": false,
@@ -93,8 +96,7 @@
     },
 
     "concrete": {
-        "_doc_pretrained": "VoiceFixer 由两个独立模型组成，权重需分别指定",
-
+        "_doc_pretrained": "VoiceFixer 预训练权重路径",
         "pretrained_weights": {
             "analysis_module": {
                 "path": "/root/autodl-tmp/voicefixer/analysis_module/checkpoints/vf.ckpt",
@@ -113,13 +115,11 @@
         "grad_clip_norm": 5.0,
 
         "freeze_strategy": {
-            "_doc": "🔥 联合微调核心：必须全部为 false/0 🔥",
             "freeze_vocoder": false,
             "freeze_encoder_layers": 0
         },
 
         "optimizer": {
-            "_doc": "🔥 联合微调核心：极低的基础学习率 🔥",
             "base_lr": 1e-5,
             "weight_decay": 1e-5,
             "lr_multipliers": {
@@ -138,7 +138,7 @@
 
         "curriculum_stages": [
             {
-                "_comment": "Stage 1: 简单",
+                "_comment": "Stage 1: 简单 - 建立基础修复能力",
                 "name": "stage1_easy",
                 "epochs": 40,
                 "phase2_intensity": 0.3,
@@ -157,7 +157,7 @@
                 "lr_scale": 1.0
             },
             {
-                "_comment": "Stage 2: 中等",
+                "_comment": "Stage 2: 中等 - 增加物理模拟复杂度",
                 "name": "stage2_medium",
                 "epochs": 60,
                 "phase2_intensity": 0.65,
@@ -176,7 +176,7 @@
                 "lr_scale": 0.8
             },
             {
-                "_comment": "Stage 3: 困难",
+                "_comment": "Stage 3: 困难 - 应对极端失真",
                 "name": "stage3_hard",
                 "epochs": 150,
                 "phase2_intensity": 1.0,
@@ -195,7 +195,7 @@
                 "lr_scale": 0.5
             },
             {
-                "_comment": "Stage 4: 全链路联合微调 (End-to-End)",
+                "_comment": "Stage 4: 全链路联合微调 - 最终质量打磨",
                 "name": "stage4_finetune",
                 "epochs": 250,
                 "phase2_intensity": 0.8,

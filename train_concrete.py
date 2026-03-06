@@ -60,7 +60,7 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from dataloaders.collators.concrete_collator import ConcreteEavesdropCollatorGPU
-
+from pytorch_lightning.plugins import DDPPlugin
 # ============================================================================
 #  PL 版本兼容层
 # ============================================================================
@@ -212,6 +212,9 @@ class AudioVisualLoggingCallback(Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
     ):
+        # [性能修复] 非可视化 epoch 直接跳过，不做任何计算
+        if trainer.current_epoch % self.log_every_n_epochs != 0:
+            return
         if self._cache_captured or batch_idx > 0:
             return
 
@@ -510,12 +513,21 @@ class AudioVisualLoggingCallback(Callback):
 #  核心：混凝土穿透语音恢复 LightningModule
 # ============================================================================
 
+# ...existing code...
+
 class ConcreteVoiceFixer(VoiceFixer):
     """
     继承原始 VoiceFixer LightningModule，覆写迁移学习相关逻辑。
     """
 
     def __init__(self, hp: dict, channels: int = 1, type_target: str = "vocals"):
+        import os
+        os.environ.setdefault("OMP_NUM_THREADS", "2")
+        os.environ.setdefault("MKL_NUM_THREADS", "2")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+
+        # ...existing code... (所有 setdefault 块保持不变)
         if "task" not in hp:
             hp["task"] = {}
         hp["task"].setdefault("inspect_training_data", False)
@@ -569,14 +581,120 @@ class ConcreteVoiceFixer(VoiceFixer):
 
         hp.setdefault("model_dir", "exp/concrete_v1")
 
-        super().__init__(hp, channels=channels, type_target=type_target)
+        # ================================================================
+        # [显存修复 - 核心] Monkeypatch torch.Tensor.cuda / Module.cuda
+        # 在 super().__init__() 期间，拦截所有 .cuda() 调用，
+        # 强制 Vocoder 在 CPU 上初始化。
+        # 这是唯一可靠的方式，因为 Vocoder.__init__ 内部
+        # 可能在任意位置调用 .cuda()/.to('cuda')
+        # ================================================================
+        _need_patch = torch.cuda.is_available()
+
+        if _need_patch:
+            # 保存原始方法
+            _orig_tensor_cuda = torch.Tensor.cuda
+            _orig_module_cuda = nn.Module.cuda
+            _orig_module_to   = nn.Module.to
+
+            # Tensor.cuda() → 返回 CPU tensor（不移动）
+            def _fake_tensor_cuda(self, *args, **kwargs):
+                return self
+
+            # Module.cuda() → 返回自身（不移动）
+            def _fake_module_cuda(self, *args, **kwargs):
+                return self
+
+            # Module.to() → 过滤掉 cuda 目标
+            def _safe_module_to(self, *args, **kwargs):
+                # 检查第一个参数是否为 cuda device
+                if args:
+                    arg0 = args[0]
+                    if isinstance(arg0, torch.device) and arg0.type == 'cuda':
+                        return self
+                    if isinstance(arg0, str) and 'cuda' in arg0:
+                        return self
+                if 'device' in kwargs:
+                    dev = kwargs['device']
+                    if isinstance(dev, torch.device) and dev.type == 'cuda':
+                        kwargs['device'] = 'cpu'
+                    elif isinstance(dev, str) and 'cuda' in dev:
+                        kwargs['device'] = 'cpu'
+                return _orig_module_to(self, *args, **kwargs)
+
+            # 应用 monkeypatch
+            torch.Tensor.cuda = _fake_tensor_cuda
+            nn.Module.cuda    = _fake_module_cuda
+            nn.Module.to      = _safe_module_to
+            print("[INIT] ★ 已拦截 .cuda()/.to('cuda')，强制 CPU 初始化")
+
+        # ---- 调用父类 __init__（Vocoder 会在这里被创建）----
+        try:
+            super().__init__(hp, channels=channels, type_target=type_target)
+        finally:
+            # ================================================================
+            # [显存修复] 无论成功与否，都必须恢复原始方法
+            # ================================================================
+            if _need_patch:
+                torch.Tensor.cuda = _orig_tensor_cuda
+                nn.Module.cuda    = _orig_module_cuda
+                nn.Module.to      = _orig_module_to
+                print("[INIT] ★ 已恢复 .cuda()/.to() 原始方法")
 
         self.hp = hp
         self.concrete_cfg = hp.get("concrete", {})
 
+        # ================================================================
+        # [显存修复] 二次确认：遍历所有子模块，强制全部回 CPU
+        # ================================================================
+        device_report = {}
+        for name, param in self.named_parameters():
+            dev = str(param.device)
+            device_report.setdefault(dev, 0)
+            device_report[dev] += param.numel()
+
+        if any('cuda' in dev for dev in device_report):
+            print(f"[INIT] ⚠ 发现参数在 GPU 上: {device_report}")
+            print("[INIT] 正在强制全部移至 CPU...")
+            self.cpu()
+
+        # 显式清理所有 GPU 的 cache
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+
+        # 打印确认
+        final_devices = set()
+        for p in self.parameters():
+            final_devices.add(str(p.device))
+        print(f"[INIT] 所有参数设备: {final_devices}")
+
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                alloc = torch.cuda.memory_allocated(i) / (1024**3)
+                reserv = torch.cuda.memory_reserved(i) / (1024**3)
+                print(f"[INIT] GPU {i}: allocated={alloc:.3f}GB, reserved={reserv:.3f}GB")
+
         self._load_pretrained_weights()
         self._apply_freeze_strategy()
+
+        # 加载权重后再次确认 CPU
+        for name, param in self.named_parameters():
+            if param.device.type == 'cuda':
+                print(f"[INIT] ⚠ 权重加载后发现 GPU 参数: {name} on {param.device}")
+                self.cpu()
+                break
+
+        self._vocoder_cache: Optional[nn.Module] = None
+        self._vocoder_name_cache: Optional[str] = None
+        voc, voc_name = self._find_vocoder_module()
+        if voc is not None:
+            self._vocoder_cache = voc
+            self._vocoder_name_cache = voc_name
         self._print_model_summary()
+
+
+
 
     # ----------------------------------------------------------------
     #  预训练权重加载
@@ -689,6 +807,10 @@ class ConcreteVoiceFixer(VoiceFixer):
             warnings.warn("[PRETRAIN] 未找到 Vocoder 子模块")
 
     def _find_vocoder_module(self) -> Tuple[Optional[nn.Module], Optional[str]]:
+        # [性能修复] 优先返回缓存，避免每次遍历整个模型树
+        if hasattr(self, '_vocoder_cache') and self._vocoder_cache is not None:
+            return self._vocoder_cache, self._vocoder_name_cache
+        # 原始查找逻辑（仅首次调用时执行）
         vocoder_module = None
         vocoder_name = None
 
@@ -801,18 +923,17 @@ class ConcreteVoiceFixer(VoiceFixer):
         """确保每个 epoch 开始时 Vocoder 保持 eval 模式"""
         freeze_cfg = self.concrete_cfg.get("freeze_strategy", {})
         if freeze_cfg.get("freeze_vocoder", True):
-            vocoder_module, _ = self._find_vocoder_module()
-            if vocoder_module is not None:
-                vocoder_module.eval()
+            if self._vocoder_cache is not None:
+                self._vocoder_cache.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
         if mode:
             freeze_cfg = self.concrete_cfg.get("freeze_strategy", {})
             if freeze_cfg.get("freeze_vocoder", True):
-                vocoder_module, _ = self._find_vocoder_module()
-                if vocoder_module is not None:
-                    vocoder_module.eval()
+                # [性能修复] 同上
+                if self._vocoder_cache is not None:
+                    self._vocoder_cache.eval()
         return self
 
     def configure_optimizers(self):
@@ -1235,14 +1356,13 @@ def validate_environment():
                 "      建议：ulimit -n 65536"
             )
 
+    tp_augment = os.path.join(git_root, "third_party", "augment")
+    if os.path.isdir(tp_augment) and tp_augment not in sys.path:
+        sys.path.insert(0, tp_augment)
     try:
-        tp_augment = os.path.join(git_root, "third_party", "augment")
-        if os.path.isdir(tp_augment) and tp_augment not in sys.path:
-            sys.path.insert(0, tp_augment)
         import augment  # type: ignore
         print(f"[ENV] augment: {augment.__file__}")
     except ImportError:
-        tp_augment = os.path.join(git_root, "third_party", "augment")
         if os.path.isdir(tp_augment):
             print(f"[ENV] augment: 本地版本 ({tp_augment})")
         else:
@@ -1481,6 +1601,10 @@ def main():
                 )
             )
 
+        # ...existing code...
+
+        # ...existing code...
+
         trainer_kwargs = dict(
             max_epochs=cumulative_epochs,
             detect_anomaly=hp["train"].get("detect_anomaly", False),
@@ -1494,33 +1618,83 @@ def main():
             accumulate_grad_batches=hp["train"].get("accumulate_grad_batches", 4),
         )
 
+        # ================================================================
+        # [修复 1] 精度设置：PL1 / PL2 分开处理
+        # ================================================================
         if torch.cuda.is_available():
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            if gpu_mem <= 10:
-                trainer_kwargs["precision"] = "16-mixed" if _USE_PL2 else 16
-                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → FP16 混合精度")
+            if _USE_PL2:
+                if gpu_mem >= 20:
+                    trainer_kwargs["precision"] = "bf16-mixed"
+                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 bf16-mixed")
+                else:
+                    trainer_kwargs["precision"] = "16-mixed"
+                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 fp16-mixed")
+            else:
+                # PL1: precision=16 启用 torch.cuda.amp
+                trainer_kwargs["precision"] = 16
+                # PL1 AMP 默认用 GradScaler，确认 amp_backend
+                if "amp_backend" not in trainer_kwargs:
+                    trainer_kwargs["amp_backend"] = "native"  # 使用 PyTorch 原生 AMP
+                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL1 fp16 (amp_backend=native)")
 
+                # 4090 支持 bf16 但 PL1 不支持 bf16-mixed
+                # 打印提示建议升级 PL
+                if gpu_mem >= 20:
+                    print(f"[TRAIN] ⚠ 4090 支持 bf16 但 PL1 不支持 bf16-mixed。")
+                    print(f"        建议: pip install pytorch-lightning>=2.0 以启用 bf16")
+
+        # ================================================================
+        # [修复 2] DDP Strategy：PL1 / PL2 正确的导入路径和参数
+        # ================================================================
         if _USE_PL2:
             if gpu_nums > 1:
-                trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
+                # PL2: DDPStrategy 在 strategies 模块下
+                try:
+                    from pytorch_lightning.strategies import DDPStrategy as PL2DDPStrategy
+                except ImportError:
+                    # 某些 PL2 早期版本仍在 plugins
+                    from pytorch_lightning.plugins import DDPPlugin as PL2DDPStrategy
+
+                # 构造参数：先检测是否支持 static_graph
+                ddp_kwargs = {
+                    "find_unused_parameters": False,
+                }
+                # static_graph 和 gradient_as_bucket_view 仅 PL2.1+ 支持
+                import inspect
+                ddp_sig = inspect.signature(PL2DDPStrategy.__init__)
+                if "static_graph" in ddp_sig.parameters:
+                    ddp_kwargs["static_graph"] = True
+                if "gradient_as_bucket_view" in ddp_sig.parameters:
+                    ddp_kwargs["gradient_as_bucket_view"] = True
+
+                trainer_kwargs["strategy"] = PL2DDPStrategy(**ddp_kwargs)
                 trainer_kwargs["devices"] = gpu_nums
                 trainer_kwargs["accelerator"] = "gpu"
                 trainer_kwargs["sync_batchnorm"] = True
+                print(f"[TRAIN] PL2 DDP: {gpu_nums} GPUs, {ddp_kwargs}")
             elif gpu_nums == 1:
                 trainer_kwargs["devices"] = 1
                 trainer_kwargs["accelerator"] = "gpu"
             else:
                 trainer_kwargs["accelerator"] = "cpu"
         else:
+            # PL1: DDPPlugin 在 plugins 模块下
             if gpu_nums > 1:
                 trainer_kwargs["gpus"] = gpu_nums
-                if DDPStrategy is not None:
-                    trainer_kwargs["strategy"] = DDPStrategy(
-                        find_unused_parameters=True
+                try:
+                    from pytorch_lightning.plugins import DDPPlugin
+                    trainer_kwargs["strategy"] = DDPPlugin(
+                        find_unused_parameters=False
                     )
+                except (ImportError, TypeError):
+                    trainer_kwargs["strategy"] = "ddp"
                 trainer_kwargs["sync_batchnorm"] = True
+                print(f"[TRAIN] PL1 DDP: {gpu_nums} GPUs")
             elif gpu_nums == 1:
                 trainer_kwargs["gpus"] = 1
+
+# ...existing code...
 
         if _USE_PL2:
             ckpt_path = (
@@ -1529,7 +1703,17 @@ def main():
         else:
             if stage_idx == START_STAGE and resume_ckpt:
                 trainer_kwargs["resume_from_checkpoint"] = resume_ckpt
-
+        # ================================================================
+        # [调试] 打印最终 trainer_kwargs，确认精度和策略生效
+        # ================================================================
+        print("\n[TRAINER] 最终配置:")
+        for k in ("precision", "strategy", "devices", "gpus",
+                   "accelerator", "accumulate_grad_batches", "sync_batchnorm"):
+            if k in trainer_kwargs:
+                v = trainer_kwargs[k]
+                # strategy 对象打印类名
+                v_str = type(v).__name__ if hasattr(v, '__class__') and not isinstance(v, (str, int, float, bool)) else str(v)
+                print(f"  {k}: {v_str}")
         trainer = Trainer(**trainer_kwargs)
 
         # [Linux修复 2] 保存 Trainer 引用供信号处理器使用
