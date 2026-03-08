@@ -580,7 +580,7 @@ class ConcreteVoiceFixer(VoiceFixer):
         hp["mel"].setdefault("fmax", 22050)
 
         hp.setdefault("model_dir", "exp/concrete_v1")
-
+        
         # ================================================================
         # [显存修复 - 核心] Monkeypatch torch.Tensor.cuda / Module.cuda
         # 在 super().__init__() 期间，拦截所有 .cuda() 调用，
@@ -639,7 +639,10 @@ class ConcreteVoiceFixer(VoiceFixer):
                 nn.Module.cuda    = _orig_module_cuda
                 nn.Module.to      = _orig_module_to
                 print("[INIT] ★ 已恢复 .cuda()/.to() 原始方法")
-
+        from torchmetrics import StructuralSimilarityIndexMeasure
+        # data_range=None 会自动根据当前 batch 计算动态范围，非常省心
+        self.ssim_loss = StructuralSimilarityIndexMeasure(data_range=20.0)
+        
         self.hp = hp
         self.concrete_cfg = hp.get("concrete", {})
 
@@ -692,7 +695,10 @@ class ConcreteVoiceFixer(VoiceFixer):
             self._vocoder_cache = voc
             self._vocoder_name_cache = voc_name
         self._print_model_summary()
-
+    def load_state_dict(self, state_dict, strict=True):
+        # 强制把 strict 改为 False，让 PyTorch 放过新加的 ssim_loss 权重
+        return super().load_state_dict(state_dict, strict=False)
+    
 
 
 
@@ -1047,21 +1053,16 @@ class ConcreteVoiceFixer(VoiceFixer):
 
         # 混合损失：L1 + SiMelSpec
         loss_l1 = self.l1loss(gen_mel, target_log_mel)
-        loss_simel = self.simelspecloss(gen_mel, target_log_mel)
-        loss = loss_l1 + 0.5 * loss_simel
-
-        self.log(
-            "train/loss_l1", loss_l1,
-            on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
-        )
-        self.log(
-            "train/loss_simel", loss_simel,
-            on_step=True, on_epoch=True, prog_bar=False, sync_dist=True,
-        )
-        self.log(
-            "train_loss", loss,
-            on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
-        )
+        
+        # 3. 计算图像 SSIM（SSIM 越大越好，最高是 1，所以 Loss 用 1 减去它）
+        loss_ssim = 1.0 - self.ssim_loss(gen_mel.float(), target_log_mel.float())
+        
+        # 4. 黄金比例混合 (0.8 保能量底色，0.2 抓高频纹理)
+        loss = 0.6 * loss_l1 + 0.4 * loss_ssim
+        # 记录日志
+        self.log("train/loss_l1", loss_l1, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/loss_ssim", loss_ssim, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return {"loss": loss}
 
@@ -1097,17 +1098,24 @@ class ConcreteVoiceFixer(VoiceFixer):
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
         val_loss_l1 = self.l1loss(estimation, target_log_mel)
-        val_loss_simel = self.simelspecloss(estimation, target_log_mel)
-        val_loss = val_loss_l1 + 0.5 * val_loss_simel
+    
+        # 3. 计算图像 SSIM（SSIM 越大越好，最高是 1，所以 Loss 用 1 减去它）
+        loss_ssim = 1.0 - self.ssim_loss(estimation.float(), target_log_mel.float())
+        
+        # 4. 黄金比例混合 (0.8 保能量底色，0.2 抓高频纹理)
+        val_loss = 0.6 * val_loss_l1 + 0.4 * loss_ssim
+
 
         self.log(
             "val/loss_l1", val_loss_l1,
             on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
         )
+
         self.log(
-            "val/loss_simel", val_loss_simel,
+            "val/loss_ssim", loss_ssim,
             on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
         )
+
         self.log(
             "val_loss", val_loss,
             on_step=False, on_epoch=True, prog_bar=True, sync_dist=True,
@@ -1456,9 +1464,9 @@ def main():
     """主入口：Curriculum Learning 训练管线（Linux 优化版）。"""
 
     # [代码修复 2] 通过命令行控制起始 Stage，不再硬编码
-    cli_args = _parse_args()
-    START_STAGE = cli_args.start_stage
-
+    #cli_args = _parse_args()
+    #START_STAGE = cli_args.start_stage
+    START_STAGE = 3
     # Linux 下 DataLoader 默认使用 fork，无需强制 spawn
     # 但在极少数情况下（使用 CUDA 初始化后 fork）需要改为 forkserver
     if platform.system() == "Linux":
@@ -1603,10 +1611,8 @@ def main():
 
         # ...existing code...
 
-        # ...existing code...
-
         trainer_kwargs = dict(
-            max_epochs=cumulative_epochs,
+            max_epochs=stage_epochs,
             detect_anomaly=hp["train"].get("detect_anomaly", False),
             num_sanity_val_steps=2,
             callbacks=callbacks,
