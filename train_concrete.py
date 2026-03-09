@@ -1625,30 +1625,18 @@ def main():
         )
 
         # ================================================================
-        # [修复 1] 精度设置：PL1 / PL2 分开处理
+        # [修复 1] 精度设置：为了兼容 SSIM 的极小方差计算，强制锁定 fp32
         # ================================================================
         if torch.cuda.is_available():
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            if _USE_PL2:
-                if gpu_mem >= 20:
-                    trainer_kwargs["precision"] = "bf16-mixed"
-                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 bf16-mixed")
-                else:
-                    trainer_kwargs["precision"] = "16-mixed"
-                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 fp16-mixed")
-            else:
-                # PL1: precision=16 启用 torch.cuda.amp
-                trainer_kwargs["precision"] = 16
-                # PL1 AMP 默认用 GradScaler，确认 amp_backend
-                if "amp_backend" not in trainer_kwargs:
-                    trainer_kwargs["amp_backend"] = "native"  # 使用 PyTorch 原生 AMP
-                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL1 fp16 (amp_backend=native)")
-
-                # 4090 支持 bf16 但 PL1 不支持 bf16-mixed
-                # 打印提示建议升级 PL
-                if gpu_mem >= 20:
-                    print(f"[TRAIN] ⚠ 4090 支持 bf16 但 PL1 不支持 bf16-mixed。")
-                    print(f"        建议: pip install pytorch-lightning>=2.0 以启用 bf16")
+            
+            # 无论 PL1 还是 PL2，无论显存多大，统统强制使用纯 32 位精度！
+            trainer_kwargs["precision"] = 32
+            
+            # 如果之前有遗留的 amp_backend 设置，安全起见直接弹掉
+            trainer_kwargs.pop("amp_backend", None)
+            
+            print(f"[TRAIN] GPU {gpu_mem:.1f}GB → 强制启用纯 fp32 精度 (彻底封杀 NaN)")
 
         # ================================================================
         # [修复 2] DDP Strategy：PL1 / PL2 正确的导入路径和参数
