@@ -1051,14 +1051,20 @@ class ConcreteVoiceFixer(VoiceFixer):
         gen_mel = gen_mel[:, :, :min_frames, :]
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
-        # 混合损失：L1 + SiMelSpec
+        # 1. 正常在 autocast (FP16) 下算 L1 Loss
         loss_l1 = self.l1loss(gen_mel, target_log_mel)
         
-        # 3. 计算图像 SSIM（SSIM 越大越好，最高是 1，所以 Loss 用 1 减去它）
-        loss_ssim = 1.0 - self.ssim_loss(gen_mel.float(), target_log_mel.float())
+        # 2. 局部强制退出混合精度上下文！
+        # 这样 SSIM 内部的 F.conv2d 就绝对不敢再降级成 FP16 了
+        with torch.autocast(device_type='cuda', enabled=False):
+            # 注意：退出 autocast 后，必须保证输入是纯正的 FP32
+            _gen = gen_mel.float()
+            _tar = target_log_mel.float()
+            loss_ssim = 1.0 - self.ssim_loss(_gen, _tar)
+            
+            # L1 也稍微转一下以防万一
+            loss = 0.5 * loss_l1.float() + 0.5 * loss_ssim.float()
         
-        # 4. 黄金比例混合 (0.8 保能量底色，0.2 抓高频纹理)
-        loss = 0.6 * loss_l1 + 0.4 * loss_ssim
         # 记录日志
         self.log("train/loss_l1", loss_l1, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/loss_ssim", loss_ssim, on_step=False, on_epoch=True, sync_dist=True)
@@ -1098,12 +1104,18 @@ class ConcreteVoiceFixer(VoiceFixer):
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
         val_loss_l1 = self.l1loss(estimation, target_log_mel)
-    
-        # 3. 计算图像 SSIM（SSIM 越大越好，最高是 1，所以 Loss 用 1 减去它）
-        loss_ssim = 1.0 - self.ssim_loss(estimation.float(), target_log_mel.float())
         
-        # 4. 黄金比例混合 (0.8 保能量底色，0.2 抓高频纹理)
-        val_loss = 0.6 * val_loss_l1 + 0.4 * loss_ssim
+        # 2. 局部强制退出混合精度上下文（保卫 SSIM 的计算精度）
+        with torch.autocast(device_type='cuda', enabled=False):
+            # 必须在结界内先转成纯正的 FP32
+            _est_fp32 = estimation.float()
+            _tar_fp32 = target_log_mel.float()
+            
+            # 3. 计算图像 SSIM（此时内部的 F.conv2d 绝对是 32 位运算，绝不下溢出）
+            loss_ssim = 1.0 - self.ssim_loss(_est_fp32, _tar_fp32)
+            
+            # 4. 混合 Loss（注意：外面的 val_loss_l1 可能还是 FP16，这里加个 .float() 防患于未然）
+            val_loss = 0.6 * val_loss_l1.float() + 0.4 * loss_ssim.float()
 
 
         self.log(
@@ -1629,15 +1641,22 @@ def main():
         # ================================================================
         if torch.cuda.is_available():
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            
-            # 无论 PL1 还是 PL2，无论显存多大，统统强制使用纯 32 位精度！
-            trainer_kwargs["precision"] = 32
-            
-            # 如果之前有遗留的 amp_backend 设置，安全起见直接弹掉
-            trainer_kwargs.pop("amp_backend", None)
-            
-            print(f"[TRAIN] GPU {gpu_mem:.1f}GB → 强制启用纯 fp32 精度 (彻底封杀 NaN)")
 
+            if _USE_PL2:
+                # PL2: 4090 支持 bf16，优先使用
+                if gpu_mem >= 20:
+                    trainer_kwargs["precision"] = "bf16-mixed"
+                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 bf16-mixed")
+                else:
+                    trainer_kwargs["precision"] = "16-mixed"
+                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 fp16-mixed")
+            else:
+                # PL1: 只支持 precision=16 (fp16) 或 32
+                # SSIM 已手动 .float()，混合精度安全
+                trainer_kwargs["precision"] = 16
+                trainer_kwargs["amp_backend"] = "native"
+                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL1 fp16 混合精度")
+                print(f"        SSIM 已在代码中 .float()，无需全局 fp32")
         # ================================================================
         # [修复 2] DDP Strategy：PL1 / PL2 正确的导入路径和参数
         # ================================================================
