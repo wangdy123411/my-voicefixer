@@ -6,14 +6,17 @@ git_root = git.Repo("", search_parent_directories=True).git.rev_parse("--show-to
 sys.path.append(git_root)
 
 import librosa
+from pesq import pesq
 import torch
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
-import speechmetrics as sm
+# import speechmetrics as sm
 from tools.pytorch.mel_scale import MelScale
 from evaluation_proc.utils import *
 
 EPS = 1e-12
+
+
 
 class ImageMetrics():
     def __init__(self):
@@ -33,7 +36,20 @@ class AudioMetrics():
         est,sr = librosa.load(est,sr=rate,mono=True)
         target, sr = librosa.load(target, sr=rate, mono=True)
         return est, target
-
+    def calculate_pesq(self, est_wav, target_wav):
+        """
+        原生 PESQ 计算：强制将 44.1kHz 降采样至 16kHz 以满足宽带 PESQ 的严苛要求
+        """
+        try:
+            # 降采样到 16000
+            est_16k = librosa.resample(y=est_wav, orig_sr=44100, target_sr=16000)
+            target_16k = librosa.resample(y=target_wav, orig_sr=44100, target_sr=16000)
+            # 'wb' 代表宽带 WideBand
+            score = pesq(16000, target_16k, est_16k, 'wb')
+            return float(score)
+        except Exception as e:
+            print(f"[Warning] PESQ 计算失败 (可能是完全静音片段): {e}")
+            return 0.0
     def wav_to_spectrogram(self, wav, rate=44100):
         if(rate == 44100):
             hop_length = 441

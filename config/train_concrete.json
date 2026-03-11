@@ -69,7 +69,7 @@
 
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
-        "max_epoches": 750,
+        "max_epoches": 1050,
         "batch_size": 72,
         "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
@@ -85,7 +85,7 @@
         "save_top_k": 3,
         "early_stop_patience": 25,
         "detect_anomaly": false,
-        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_9/checkpoints/stage3_epoch=439-step=124960-val_loss=0.2176.ckpt"
+        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_11/checkpoints/stage3_epoch=549-step=156200-val_loss=0.2139.ckpt"
     },
 
     "log": {
@@ -97,6 +97,7 @@
 
     "concrete": {
         "_doc_pretrained": "VoiceFixer 预训练权重路径",
+        "concrete_ratio": 0.7,
         "pretrained_weights": {
             "analysis_module": {
                 "path": "/root/autodl-tmp/voicefixer/analysis_module/checkpoints/vf.ckpt",
@@ -197,21 +198,21 @@
             {
                 "_comment": "Stage 4: 全链路联合微调 - 最终质量打磨",
                 "name": "stage4_finetune",
-                "epochs": 500,
-                "phase2_intensity": 0.8,
+                "epochs": 700,
+                "phase2_intensity": 1.0,
                 "physics_config": {
-                    "jfet_gain": 1.0,
-                    "jfet_harmonic": 0.1,
-                    "emi_snr_db": [10, 35],
+                    "jfet_gain": 1.2,
+                    "jfet_harmonic": 0.15,
+                    "emi_snr_db": [5, 20],
                     "emi_freqs": [50, 1000, 2048],
-                    "demod_lpf_cutoff": 5000
+                    "demod_lpf_cutoff": 4000
                 },
                 "collator_config": {
-                    "cutoff_range": [2000, 4000],
+                    "cutoff_range": [1500, 2500],
                     "apply_prob": 1.0
                 },
                 "unfreeze_encoder_layers": 999,
-                "lr_scale": 0.003
+                "lr_scale": 0.03
             }
         ]
     }

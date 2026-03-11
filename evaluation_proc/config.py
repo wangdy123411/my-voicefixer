@@ -32,8 +32,8 @@ class Config:
     r = os.path.dirname(git_root)
 
     # TEST_ROOT = "/Volumes/Haohe_SSD/TestSets_bak"
-    TEST_ROOT = os.path.join(r, "voicefixer_main/datasets/se/TestSets")
-    EVAL_RESULT = os.path.join(r, "voicefixer_main/exp_results")
+    TEST_ROOT = os.path.join(r, "voicefixer/datasets/se/TestSets")
+    EVAL_RESULT = os.path.join(r, "voicefixer/exp_results")
 
     makedirs(EVAL_RESULT,exist_ok=True)
 

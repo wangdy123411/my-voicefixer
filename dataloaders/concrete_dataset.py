@@ -1,10 +1,4 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2026/2/25
-# @Author  : Concrete Eavesdrop System 3022234317@tju.edu.cn
-# @FileName: concrete_dataset.py
-#
-# 混凝土穿透语音恢复专用数据集
-# 读取干净语音 → 双规制增强 → 返回 (degraded, clean) 训练对
+# ...existing code...
 
 import os
 import warnings
@@ -18,21 +12,38 @@ from torch.utils.data import Dataset
 
 from dataloaders.augmentation.base import AudioAug
 
+# ================================================================
+# [抗过拟合] 导入原始 VoiceFixer 增强函数
+# ================================================================
+try:
+    from dataloaders.augmentation.base import add_noise_and_scale_with_HQ_with_Aug
+    _HAS_ORIG_AUG = True
+except ImportError:
+    _HAS_ORIG_AUG = False
+    warnings.warn(
+        "[ConcreteAugDataset] 无法导入原始 VoiceFixer 增强函数 "
+        "add_noise_and_scale_with_HQ_with_Aug，30% 通用增强分支将退化为仅 Phase 1"
+    )
+
 
 class ConcreteAugDataset(Dataset):
     """
     混凝土穿透场景数据集。
 
-    数据流：
-    ┌──────────┐    ┌──────────────────────┐    ┌───────────────────┐
-    │ 干净语音  │ ──→ │ Phase 1: 环境声学做旧 │ ──→ │ Phase 2: 物理链路  │ ──→ (degraded, clean)
-    │ .wav文件  │    │ (混响/EQ/变速...)     │    │ (JFET/AM/混凝土IR) │
-    └──────────┘    └──────────────────────┘    └───────────────────┘
-
-    与原始 VoiceFixer 数据集的关系：
-    - 原始数据集在 __getitem__ 中调用 AudioAug.perform() 做单阶段增强
-    - 本类扩展为双阶段增强，并新增 phase2_intensity 控制
-    - 保持与原始 collate 兼容的输出格式
+    数据流（抗过拟合版）：
+    ┌──────────┐
+    │ 干净语音  │
+    │ .wav文件  │
+    └────┬─────┘
+         │
+         ├─── 70% ──→ Phase 0(加噪) → Phase 1(环境声学) → Phase 2(混凝土物理链路)  → (degraded, clean)
+         │
+         └─── 30% ──→ 原始 VoiceFixer 增强（add_noise_and_scale_with_HQ_with_Aug） → (degraded, clean)
+    
+    设计原理：
+    - 70% 混凝土链路：保留核心任务的学习能力
+    - 30% 通用增强：恢复 VoiceFixer 的通用降噪/去混响/超分辨先验，防止过拟合
+    - 验证集：固定 50% / 50% 分流，保证评估基准稳定
     """
 
     def __init__(
@@ -42,28 +53,26 @@ class ConcreteAugDataset(Dataset):
         audio_aug: Optional[AudioAug] = None,
         phase2_intensity: float = 0.5,
     ):
-        """
-        Args:
-            hp: 超参配置字典
-            split: "train" 或 "val"
-            audio_aug: 双规制数据增强引擎（外部注入，避免每个 worker 重复初始化）
-            phase2_intensity: Phase 2 物理链路强度 [0, 1]
-        """
         super().__init__()
         self.hp = hp
         self.split = split
         self.audio_aug = audio_aug
-        
-        # 【核心修复 1】：如果是验证集，强制将强度锁定为 0.5（或 1.0），
-        # 保证验证基准的恒定，并且让终端打印的日志完全准确！
+
+        # ================================================================
+        # [抗过拟合] 混凝土链路占比，从配置读取，默认 0.7
+        # ================================================================
+        concrete_cfg = hp.get("concrete", {})
         if self.split == "val":
             self.phase2_intensity = 0.5
+            # 验证集固定 50/50 分流，保证评估基准不随训练阶段变化
+            self.concrete_ratio = 0.5
         else:
             self.phase2_intensity = phase2_intensity
+            self.concrete_ratio = concrete_cfg.get("concrete_ratio", 0.7)
 
         # ---- 音频参数 ----
         self.sample_rate = hp["data"]["sampling_rate"]
-        self.segment_length = hp["data"].get("segment_length", self.sample_rate)  # 默认 1 秒
+        self.segment_length = hp["data"].get("segment_length", self.sample_rate)
 
         # ---- 加载文件列表 ----
         dataset_key = "train_dataset" if split == "train" else "val_dataset"
@@ -76,8 +85,15 @@ class ConcreteAugDataset(Dataset):
             dataset_cfg.get("speech", {}).get("noise", "")
         )
 
-        # ---- 增强效果列表（从配置中提取）----
-        self.effect_names = list(hp.get("augment", {}).get("effects", {}).keys())
+        # ---- 增强效果列表 ----
+        effects_cfg = hp.get("augment", {}).get("effects", {})
+        self.effect_names = list(effects_cfg.keys()) if effects_cfg else None
+
+        # ================================================================
+        # [抗过拟合] 原始 VoiceFixer 增强所需的噪声文件列表
+        # add_noise_and_scale_with_HQ_with_Aug 需要 noise_files 参数
+        # ================================================================
+        self._orig_aug_available = _HAS_ORIG_AUG and len(self.noise_files) > 0
 
         # ---- 验证 ----
         if len(self.vocal_files) == 0:
@@ -86,19 +102,15 @@ class ConcreteAugDataset(Dataset):
                 f"{dataset_cfg.get('speech', {}).get('vocal', 'N/A')}"
             )
 
-        # 此时打印出来的验证集 Phase 2 强度就会是正确的 0.5 了
         print(
             f"[ConcreteAugDataset/{split}] "
             f"语音: {len(self.vocal_files)} 文件, "
             f"噪声: {len(self.noise_files)} 文件, "
             f"片段长度: {self.segment_length} 采样点, "
-            f"Phase 2 强度: {self.phase2_intensity}"
+            f"Phase 2 强度: {self.phase2_intensity}, "
+            f"混凝土占比: {self.concrete_ratio:.0%}, "
+            f"原始增强占比: {1 - self.concrete_ratio:.0%}"
         )
-        
-        # ---- 增强效果列表（从配置中提取）----
-        # 如果为空列表，augment 会使用 random_server 内置默认效果
-        effects_cfg = hp.get("augment", {}).get("effects", {})
-        self.effect_names = list(effects_cfg.keys()) if effects_cfg else None
 
     def __len__(self) -> int:
         return len(self.vocal_files)
@@ -106,128 +118,288 @@ class ConcreteAugDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
         返回一个训练样本。
+        
+        [抗过拟合] 按 concrete_ratio 概率分流：
+        - concrete_ratio (70%) → 混凝土双规制增强链路
+        - 1 - concrete_ratio (30%) → 原始 VoiceFixer 增强逻辑
         """
         # ---- 1. 读取干净语音 (Target) ----
         clean = self._load_audio_segment(self.vocal_files[idx])
 
-        # ---- 2. 混合环境噪声 (Phase 0) ----
-        input_frames = clean.copy()
-        
-        # 【核心修复】：移除只在 train 加噪的限制，验证集也必须包含环境背景音！
-        if self.noise_files:
-            if self.split == "train":
-                # 训练时：85% 概率加噪，完全随机的信噪比和音量
-                if random.random() < 0.85:
-                    add_noise = True
-                    snr_db = random.uniform(-5.0, 35.0)
-                    scale = random.uniform(0.6, 1.0)
-                else:
-                    add_noise = False
-            else:
-                # 验证集：100% 加噪，但使用固定的中等难度参数
-                # 保证每次 validation 的评估基准完全一致，且画图能清晰看到 Phase 1
-                add_noise = True
-                snr_db = 15.0  # 固定 15dB 信噪比 (中等环境噪音)
-                scale = 0.8    # 固定 0.8 音量缩放
+        # ---- 2. 分流决策 ----
+        use_concrete = random.random() < self.concrete_ratio
 
-            if add_noise:
-                noise = self._load_random_noise(clean.shape[0])
-                
-                # 计算 RMS 能量
-                clean_rms = np.sqrt(np.mean(clean**2) + 1e-10)
-                noise_rms = np.sqrt(np.mean(noise**2) + 1e-10)
-                
-                # 根据设定的 SNR 缩放噪声并与干净语音混合
-                target_noise_rms = clean_rms / (10 ** (snr_db / 20.0))
-                noise_scaled = noise * (target_noise_rms / noise_rms)
-                input_frames = clean + noise_scaled
-                # 【新增】同步缩放干净目标，保证输入和目标的音量基准一致！
-                clean = clean * scale
-                # 整体音量缩放
-                input_frames = input_frames * scale
-                
-                # 兜底防爆音裁剪
-                peak = np.max(np.abs(input_frames))
-                if peak > 0.99:
-                    input_frames = (input_frames / peak) * 0.95
-
-        # ---- 3. 送入双规制增强管线 (Phase 1 & Phase 2) ----
-        if self.audio_aug is not None:
-            if self.split == "train":
-                apply_phase2 = self.phase2_intensity > 0
-                current_intensity = self.phase2_intensity
-            else:
-                # 【核心修复 2】：验证集/画图时强制开启 Phase 2！
-                # 保证每次 Epoch 评估的标准一致，且能让 TensorBoard 画出清晰的穿墙/电流特征图。
-                apply_phase2 = True
-                # 这里直接使用 __init__ 里修正好的类属性，避免硬编码
-                current_intensity = self.phase2_intensity 
-
-            degraded, metadata = self.audio_aug.augment(
-                frames=input_frames,
-                effects=self.effect_names,
-                sample_rate=self.sample_rate,
-                apply_phase2=apply_phase2,           # 传入修复后的布尔值
-                phase2_intensity=current_intensity,  # 传入修复后的强度值
-            )
+        if use_concrete:
+            # ============================================================
+            # 路径 A：混凝土双规制增强（70%）
+            # Phase 0(加噪) → Phase 1(环境声学) → Phase 2(混凝土物理链路)
+            # ============================================================
+            degraded, clean, phase1 = self._augment_concrete(clean)
+            aug_type = "concrete"
         else:
-            degraded = input_frames.copy()
-            metadata = {"phase1_audio": input_frames.copy(), "phase1_effects": None, "phase2_applied": False}
-            
-        # ---- 4. 格式化并返回结果 ----
+            # ============================================================
+            # 路径 B：原始 VoiceFixer 通用增强（30%）
+            # 使用 add_noise_and_scale_with_HQ_with_Aug
+            # ============================================================
+            degraded, clean, phase1 = self._augment_voicefixer_original(clean)
+            aug_type = "voicefixer"
+
+        # ---- 3. 格式化并返回结果 ----
         if isinstance(degraded, torch.Tensor):
             degraded = degraded.numpy()
         if isinstance(clean, torch.Tensor):
             clean = clean.numpy()
-        phase1 = metadata.get("phase1_audio", input_frames.copy())
-        if isinstance(phase1, torch.Tensor): 
+        if isinstance(phase1, torch.Tensor):
             phase1 = phase1.numpy()
 
-        # 获取当前实际长度
+        # 确保都是 float32 numpy
+        degraded = np.asarray(degraded, dtype=np.float32)
+        clean = np.asarray(clean, dtype=np.float32)
+        phase1 = np.asarray(phase1, dtype=np.float32)
+
+        # 长度对齐
         len_d, len_c, len_p = len(degraded), len(clean), len(phase1)
         max_len = max(len_d, len_c, len_p)
-        
-        # 额外保护：为每个音频独立计算微淡出 (Fade-out)，防短信号硬截断
+
+        # 淡出防截断
         def apply_fadeout(audio_arr):
             arr_len = len(audio_arr)
-            # 自适应淡出长度：最长 256 点，若信号极短则取其 5%
             f_len = min(256, arr_len // 20)
             if f_len > 1:
                 f_curve = np.linspace(1.0, 0.0, f_len, dtype=np.float32)
                 audio_arr[-f_len:] = audio_arr[-f_len:] * f_curve
             return audio_arr
 
-        # 【必须在 padding 补零之前执行】，确保淡出的是真实的信号边缘
         degraded = apply_fadeout(degraded)
         clean = apply_fadeout(clean)
         phase1 = apply_fadeout(phase1)
 
-        # 强制对齐维度：使用 zero-padding 补齐到 max_len
+        # Zero-padding 对齐
         if len_d < max_len:
-            degraded = np.pad(degraded, (0, max_len - len_d), mode='constant', constant_values=0.0)
+            degraded = np.pad(degraded, (0, max_len - len_d), mode='constant')
         if len_c < max_len:
-            clean = np.pad(clean, (0, max_len - len_c), mode='constant', constant_values=0.0)
+            clean = np.pad(clean, (0, max_len - len_c), mode='constant')
         if len_p < max_len:
-            phase1 = np.pad(phase1, (0, max_len - len_p), mode='constant', constant_values=0.0)
+            phase1 = np.pad(phase1, (0, max_len - len_p), mode='constant')
 
         result = {
-            "input_wave": degraded.astype(np.float32),    # 给模型输入的残缺音频 (Phase2)
-            "target_wave": clean.astype(np.float32),      # 纯净的拟合目标 (Clean)
-            "phase1_wave": phase1.astype(np.float32),     # 记录中间状态，用于 TensorBoard 听感
+            "input_wave": degraded,
+            "target_wave": clean,
+            "phase1_wave": phase1,
         }
 
         return result
 
     # ================================================================
-    #  文件扫描与音频读取
+    #  路径 A：混凝土双规制增强
+    # ================================================================
+
+    def _augment_concrete(self, clean: np.ndarray):
+        """
+        原始混凝土链路：Phase 0(加噪) → Phase 1 → Phase 2。
+        返回 (degraded, clean, phase1)
+        """
+        input_frames = clean.copy()
+
+        # Phase 0: 环境噪声混合
+        if self.noise_files:
+            if self.split == "train":
+                if random.random() < 0.85:
+                    input_frames, clean = self._mix_noise(
+                        input_frames, clean,
+                        snr_range=(-5.0, 35.0),
+                        scale_range=(0.6, 1.0),
+                    )
+            else:
+                # 验证集：固定参数
+                input_frames, clean = self._mix_noise(
+                    input_frames, clean,
+                    snr_range=(15.0, 15.0),
+                    scale_range=(0.8, 0.8),
+                )
+
+        # Phase 1 + Phase 2
+        if self.audio_aug is not None:
+            if self.split == "train":
+                apply_phase2 = self.phase2_intensity > 0
+                current_intensity = self.phase2_intensity
+            else:
+                apply_phase2 = True
+                current_intensity = self.phase2_intensity
+
+            degraded, metadata = self.audio_aug.augment(
+                frames=input_frames,
+                effects=self.effect_names,
+                sample_rate=self.sample_rate,
+                apply_phase2=apply_phase2,
+                phase2_intensity=current_intensity,
+            )
+            phase1 = metadata.get("phase1_audio", input_frames.copy())
+        else:
+            degraded = input_frames.copy()
+            phase1 = input_frames.copy()
+
+        return degraded, clean, phase1
+
+    # ================================================================
+    #  路径 B：原始 VoiceFixer 通用增强
+    # ================================================================
+
+    # ...existing code...
+
+    def _augment_voicefixer_original(self, clean: np.ndarray):
+        """
+        调用原始 VoiceFixer 的 add_noise_and_scale_with_HQ_with_Aug。
+
+        真实签名：
+            add_noise_and_scale_with_HQ_with_Aug(HQ, front, augfront, noise, ...)
+            → (HQ, front, augfront, noise, snr, scale)
+
+        参数含义：
+            HQ       = 高质量目标（干净语音）
+            front    = 未增强的输入（和 HQ 相同或略有差异）
+            augfront = Phase 1 增强后的音频
+            noise    = 噪声信号
+
+        返回 (degraded, clean, phase1)
+        """
+        if self._orig_aug_available:
+            try:
+                # ---- Step 1: 先执行 Phase 1 环境声学增强（得到 augfront）----
+                augfront_np = clean.copy()
+                if self.audio_aug is not None and hasattr(self.audio_aug, 'magical_effects'):
+                    try:
+                        effects = self.effect_names or []
+                        if effects:
+                            augfront_np, _ = self.audio_aug.magical_effects.effect(
+                                augfront_np,
+                                effects,
+                                self.sample_rate,
+                                None,
+                                True,
+                            )
+                    except Exception:
+                        pass  # Phase 1 失败则 augfront = clean
+
+                # ---- Step 2: 加载噪声 ----
+                noise_np = self._load_random_noise(len(clean))
+
+                # ---- Step 3: numpy → torch.Tensor（原始函数要求 Tensor）----
+                HQ       = torch.from_numpy(clean.copy()).float()
+                front    = torch.from_numpy(clean.copy()).float()
+                augfront = torch.from_numpy(augfront_np).float()
+                noise    = torch.from_numpy(noise_np).float()
+
+                # ---- Step 4: 调用原始增强函数 ----
+                HQ_out, front_out, augfront_out, noise_out, snr, scale = \
+                    add_noise_and_scale_with_HQ_with_Aug(
+                        HQ, front, augfront, noise,
+                        snr_l=-5, snr_h=35,
+                        scale_lower=0.6, scale_upper=1.0,
+                    )
+
+                # ---- Step 5: torch → numpy 返回 ----
+                # degraded = augfront_out + noise_out（增强后的前端 + 噪声）
+                degraded = (augfront_out + noise_out).numpy()
+                clean_final = HQ_out.numpy()
+                phase1 = augfront_out.numpy()  # Phase 1 结果（增强后，未加噪）
+
+                return degraded, clean_final, phase1
+
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"[ConcreteAugDataset] 原始 VoiceFixer 增强失败: {e}，"
+                    f"回退到仅 Phase 1 增强"
+                )
+                return self._augment_phase1_only(clean)
+        else:
+            return self._augment_phase1_only(clean)
+
+    # ...existing code...
+    def _augment_phase1_only(self, clean: np.ndarray):
+        """
+        回退方案：只执行 Phase 1（环境声学做旧），跳过 Phase 2。
+        当原始 VoiceFixer 增强函数不可用时使用。
+        """
+        input_frames = clean.copy()
+
+        # 加噪
+        if self.noise_files:
+            if self.split == "train":
+                if random.random() < 0.85:
+                    input_frames, clean = self._mix_noise(
+                        input_frames, clean,
+                        snr_range=(-5.0, 35.0),
+                        scale_range=(0.6, 1.0),
+                    )
+            else:
+                input_frames, clean = self._mix_noise(
+                    input_frames, clean,
+                    snr_range=(15.0, 15.0),
+                    scale_range=(0.8, 0.8),
+                )
+
+        # 仅 Phase 1，不执行 Phase 2
+        if self.audio_aug is not None:
+            degraded, metadata = self.audio_aug.augment(
+                frames=input_frames,
+                effects=self.effect_names,
+                sample_rate=self.sample_rate,
+                apply_phase2=False,          # ← 关键：跳过混凝土链路
+                phase2_intensity=0.0,
+            )
+            phase1 = metadata.get("phase1_audio", input_frames.copy())
+        else:
+            degraded = input_frames.copy()
+            phase1 = input_frames.copy()
+
+        return degraded, clean, phase1
+
+    # ================================================================
+    #  噪声混合工具
+    # ================================================================
+
+    def _mix_noise(
+        self,
+        input_frames: np.ndarray,
+        clean: np.ndarray,
+        snr_range: tuple = (-5.0, 35.0),
+        scale_range: tuple = (0.6, 1.0),
+    ):
+        """
+        噪声混合。抽取为独立方法，路径 A/B 共用。
+        
+        返回 (mixed_input, scaled_clean)
+        """
+        noise = self._load_random_noise(clean.shape[0])
+
+        snr_db = random.uniform(*snr_range)
+        scale = random.uniform(*scale_range)
+
+        clean_rms = np.sqrt(np.mean(clean ** 2) + 1e-10)
+        noise_rms = np.sqrt(np.mean(noise ** 2) + 1e-10)
+
+        target_noise_rms = clean_rms / (10 ** (snr_db / 20.0))
+        noise_scaled = noise * (target_noise_rms / noise_rms)
+
+        mixed = (input_frames + noise_scaled) * scale
+        clean_scaled = clean * scale
+
+        # 防爆音
+        peak = np.max(np.abs(mixed))
+        if peak > 0.99:
+            mixed = (mixed / peak) * 0.95
+
+        return mixed, clean_scaled
+
+    # ================================================================
+    #  文件扫描与音频读取（不变）
     # ================================================================
 
     @staticmethod
     def _scan_audio_files(directory: str) -> list:
-        """
-        递归扫描目录下的音频文件。
-        支持 .wav, .flac, .ogg, .mp3 格式。
-        """
+        # ...existing code...
         if not directory or not os.path.isdir(directory):
             return []
 
@@ -240,16 +412,7 @@ class ConcreteAugDataset(Dataset):
         return files
 
     def _load_audio_segment(self, filepath: str) -> np.ndarray:
-        """
-        读取音频文件的随机片段。
-
-        策略：
-        - 训练时：随机起点截取 segment_length
-        - 验证时：从头截取 segment_length（可复现）
-        - 文件短于 segment_length：零填充
-
-        使用 soundfile 而非 librosa，避免 resampy 的额外开销。
-        """
+        # ...existing code...
         try:
             info = sf.info(filepath)
             total_frames = info.frames
@@ -258,11 +421,9 @@ class ConcreteAugDataset(Dataset):
             warnings.warn(f"无法读取音频信息 {filepath}: {e}")
             return np.zeros(self.segment_length, dtype=np.float32)
 
-        # 计算需要读取的采样点数（考虑采样率差异）
         sr_ratio = file_sr / self.sample_rate
         needed_frames = int(self.segment_length * sr_ratio)
 
-        # 确定起始位置
         if total_frames <= needed_frames:
             start = 0
             frames_to_read = total_frames
@@ -273,7 +434,6 @@ class ConcreteAugDataset(Dataset):
             start = 0
             frames_to_read = needed_frames
 
-        # 读取
         try:
             audio, sr = sf.read(
                 filepath,
@@ -286,37 +446,27 @@ class ConcreteAugDataset(Dataset):
             warnings.warn(f"读取音频失败 {filepath}: {e}")
             return np.zeros(self.segment_length, dtype=np.float32)
 
-        # 多声道转单声道
         if audio.ndim > 1:
             audio = np.mean(audio, axis=1)
 
-        # 重采样（如需要）
         if sr != self.sample_rate:
             audio = self._simple_resample(audio, sr, self.sample_rate)
 
         return audio.astype(np.float32)
 
     def _load_random_noise(self, length: int) -> np.ndarray:
-        """随机选取一段噪声"""
+        # ...existing code...
         noise_path = random.choice(self.noise_files)
         noise = self._load_audio_segment(noise_path)
 
-        # 确保噪声长度与信号匹配
         if len(noise) < length:
-            # 循环填充
             repeats = (length // len(noise)) + 1
             noise = np.tile(noise, repeats)
         return noise[:length]
 
     @staticmethod
     def _simple_resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """
-        简单重采样（线性插值）。
-        
-        注意：对训练数据来说线性插值精度足够，
-        且比 librosa.resample 快约 10 倍。
-        如需高精度重采样，可替换为 scipy.signal.resample_poly。
-        """
+        # ...existing code...
         if orig_sr == target_sr:
             return audio
         ratio = target_sr / orig_sr
@@ -326,7 +476,7 @@ class ConcreteAugDataset(Dataset):
 
     @staticmethod
     def _pad_or_trim(tensor: torch.Tensor, target_length: int) -> torch.Tensor:
-        """填充或截断到固定长度"""
+        # ...existing code...
         current = tensor.shape[-1]
         if current >= target_length:
             return tensor[..., :target_length]

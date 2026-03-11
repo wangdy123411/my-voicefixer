@@ -1709,13 +1709,30 @@ def main():
 
 # ...existing code...
 
-        if _USE_PL2:
-            ckpt_path = (
-                resume_ckpt if (stage_idx == START_STAGE and resume_ckpt) else None
-            )
+        # ================================================================
+        # [终极修复] 灵魂注入：手动加载权重，舍弃旧优化器状态！
+        # ================================================================
+        if stage_idx == START_STAGE and resume_ckpt:
+            print(f"\n[INFO] 正在强行注入巅峰权重: {resume_ckpt}")
+            print(f"[INFO] 开启 strict=False，拥抱超级感受野，彻底抛弃旧优化器！")
+            
+            # 1. 强行读取旧 Checkpoint
+            checkpoint = torch.load(resume_ckpt, map_location=lambda storage, loc: storage)
+            
+            # 2. 注入灵魂：strict=False 会完美放过我们新加的 DilatedTimeBottleneck
+            model.load_state_dict(checkpoint["state_dict"], strict=False)
+            
+            # 3. 极其关键的拦截：切断 Lightning 自带的恢复机制
+            ckpt_path = None 
+            trainer_kwargs.pop("resume_from_checkpoint", None)
+            # 👇👇👇 [新增代码] 冻结疗法：保护老将，只练新兵 👇👇👇
+            print("[INFO] 正在执行冻结疗法：锁死主干网络，仅训练新加入的膨胀瓶颈层...")
+            for name, param in model.named_parameters():
+                # 只要名字里不包含 conv_block7，就全部锁死不更新！
+                if "conv_block7" not in name:
+                    param.requires_grad = False
         else:
-            if stage_idx == START_STAGE and resume_ckpt:
-                trainer_kwargs["resume_from_checkpoint"] = resume_ckpt
+            ckpt_path = None
         # ================================================================
         # [调试] 打印最终 trainer_kwargs，确认精度和策略生效
         # ================================================================

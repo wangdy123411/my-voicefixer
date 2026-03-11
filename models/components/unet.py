@@ -9,6 +9,50 @@ from models.components.modules import *
 from tools.pytorch.losses import *
 from tools.pytorch.pytorch_util import *
 
+import torch.nn as nn
+
+class DilatedTimeBottleneck(nn.Module):
+    """
+    专门针对长尾混响和群延迟设计的膨胀瓶颈层。
+    通过在时间轴（W）上呈指数级扩大 dilation，强行撑开网络的时域感受野。
+    假设输入特征图格式为 [Batch, Channels, Freq(H), Time(W)]
+    """
+    def __init__(self, channels, momentum=0.01):
+        super(DilatedTimeBottleneck, self).__init__()
+        
+        # 第1层：标准感受野 (Time Dilation = 1)
+        # padding=(1, 1) 保证尺寸不变
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=(3, 3), padding=(1, 1), dilation=(1, 1), bias=False),
+            nn.BatchNorm2d(channels, momentum=momentum),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 第2层：时间轴拉宽一倍 (Time Dilation = 2)
+        # padding=(1, 2) 保证尺寸不变
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=(3, 3), padding=(1, 2), dilation=(1, 2), bias=False),
+            nn.BatchNorm2d(channels, momentum=momentum),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 第3层：时间轴拉宽四倍 (Time Dilation = 4)
+        # padding=(1, 4) 保证尺寸不变
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=(3, 3), padding=(1, 4), dilation=(1, 4), bias=False),
+            nn.BatchNorm2d(channels, momentum=momentum),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # 引入残差连接 (Residual Connection)，防止加深网络后梯度消失
+        res = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        return out + res
+
+
 class UNetResComplex_100Mb(nn.Module):
     def __init__(self, channels, nsrc=1):
         super(UNetResComplex_100Mb, self).__init__()
@@ -31,8 +75,8 @@ class UNetResComplex_100Mb(nn.Module):
                                                  downsample=(2, 2), activation=activation, momentum=momentum)
         self.encoder_block6 = EncoderBlockRes4B(in_channels=384, out_channels=384,
                                                  downsample=(2, 2), activation=activation, momentum=momentum)
-        self.conv_block7 = ConvBlockRes(in_channels=384, out_channels=384,
-                                           kernel_size=(3,3), activation=activation, momentum=momentum)
+        # 替换为全新的时间膨胀瓶颈层，打通时域任督二脉
+        self.conv_block7 = DilatedTimeBottleneck(channels=384, momentum=momentum)
         self.decoder_block1 = DecoderBlockRes4B(in_channels=384, out_channels=384,
                                                  stride=(2, 2), activation=activation, momentum=momentum)
         self.decoder_block2 = DecoderBlockRes4B(in_channels=384, out_channels=384,
