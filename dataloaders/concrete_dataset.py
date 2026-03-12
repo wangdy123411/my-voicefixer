@@ -249,48 +249,50 @@ class ConcreteAugDataset(Dataset):
 
     def _augment_voicefixer_original(self, clean: np.ndarray):
         """
-        调用原始 VoiceFixer 的 add_noise_and_scale_with_HQ_with_Aug。
-
-        真实签名：
-            add_noise_and_scale_with_HQ_with_Aug(HQ, front, augfront, noise, ...)
-            → (HQ, front, augfront, noise, snr, scale)
-
-        参数含义：
-            HQ       = 高质量目标（干净语音）
-            front    = 未增强的输入（和 HQ 相同或略有差异）
-            augfront = Phase 1 增强后的音频
-            noise    = 噪声信号
-
-        返回 (degraded, clean, phase1)
+        [修复] 30% 通用增强路径：补全原始 VoiceFixer 缺失的退化类型。
+        
+        原始 VoiceFixer 的 training_step 中包含以下增强（我们覆写后丢失了）：
+        1. 随机降采样 → 上采样（模拟低采样率录音）
+        2. 随机带通滤波（模拟电话/对讲机）
+        3. 随机 codec 压缩伪影
+        4. 混响 + 加噪
+        
+        这里补全前两种，第三种依赖外部库暂不加。
         """
         if self._orig_aug_available:
             try:
-                # ---- Step 1: 先执行 Phase 1 环境声学增强（得到 augfront）----
+                # ---- Step 0: 随机降采样模拟（50% 概率）----
                 augfront_np = clean.copy()
-                if self.audio_aug is not None and hasattr(self.audio_aug, 'magical_effects'):
+                if random.random() < 0.5:
+                    augfront_np = self._random_resample_degrade(augfront_np)
+
+                # ---- Step 0.5: 随机带通滤波（40% 概率）----
+                if random.random() < 0.4:
+                    augfront_np = self._random_bandpass(augfront_np)
+
+                # ---- Step 1: Phase 1 环境声学增强 ----
+                if self.audio_aug is not None:
                     try:
-                        effects = self.effect_names or []
-                        if effects:
-                            augfront_np, _ = self.audio_aug.magical_effects.effect(
-                                augfront_np,
-                                effects,
-                                self.sample_rate,
-                                None,
-                                True,
-                            )
+                        degraded_p1, metadata = self.audio_aug.augment(
+                            frames=augfront_np,
+                            effects=self.effect_names,
+                            sample_rate=self.sample_rate,
+                            apply_phase2=False,
+                            phase2_intensity=0.0,
+                        )
+                        augfront_np = degraded_p1
                     except Exception:
-                        pass  # Phase 1 失败则 augfront = clean
+                        pass
 
                 # ---- Step 2: 加载噪声 ----
                 noise_np = self._load_random_noise(len(clean))
 
-                # ---- Step 3: numpy → torch.Tensor（原始函数要求 Tensor）----
+                # ---- Step 3: 调用原始增强函数 ----
                 HQ       = torch.from_numpy(clean.copy()).float()
                 front    = torch.from_numpy(clean.copy()).float()
                 augfront = torch.from_numpy(augfront_np).float()
                 noise    = torch.from_numpy(noise_np).float()
 
-                # ---- Step 4: 调用原始增强函数 ----
                 HQ_out, front_out, augfront_out, noise_out, snr, scale = \
                     add_noise_and_scale_with_HQ_with_Aug(
                         HQ, front, augfront, noise,
@@ -298,24 +300,65 @@ class ConcreteAugDataset(Dataset):
                         scale_lower=0.6, scale_upper=1.0,
                     )
 
-                # ---- Step 5: torch → numpy 返回 ----
-                # degraded = augfront_out + noise_out（增强后的前端 + 噪声）
                 degraded = (augfront_out + noise_out).numpy()
                 clean_final = HQ_out.numpy()
-                phase1 = augfront_out.numpy()  # Phase 1 结果（增强后，未加噪）
+                phase1 = augfront_out.numpy()
 
                 return degraded, clean_final, phase1
-
             except Exception as e:
-                import warnings
-                warnings.warn(
-                    f"[ConcreteAugDataset] 原始 VoiceFixer 增强失败: {e}，"
-                    f"回退到仅 Phase 1 增强"
-                )
+                warnings.warn(f"[ConcreteAugDataset] 原始增强失败: {e}")
                 return self._augment_phase1_only(clean)
         else:
             return self._augment_phase1_only(clean)
+    def _random_resample_degrade(self, audio: np.ndarray) -> np.ndarray:
+        """
+        随机降采样再上采样，模拟低质量录音设备。
+        这是原始 VoiceFixer 训练中的核心增强之一。
+        """
+        # 随机选择一个低采样率
+        low_sr = random.choice([8000, 11025, 16000, 22050, 24000, 32000])
+        if low_sr >= self.sample_rate:
+            return audio
 
+        # 降采样
+        ratio_down = low_sr / self.sample_rate
+        n_down = int(len(audio) * ratio_down)
+        if n_down < 100:
+            return audio
+        indices_down = np.linspace(0, len(audio) - 1, n_down)
+        downsampled = np.interp(indices_down, np.arange(len(audio)), audio)
+
+        # 上采样回原始采样率
+        indices_up = np.linspace(0, len(downsampled) - 1, len(audio))
+        upsampled = np.interp(indices_up, np.arange(len(downsampled)), downsampled)
+
+        return upsampled.astype(np.float32)
+    def _random_bandpass(self, audio: np.ndarray) -> np.ndarray:
+        """
+        随机带通滤波，模拟电话/对讲机频响。
+        """
+        try:
+            from scipy.signal import butter, sosfiltfilt
+
+            # 随机低切和高切频率
+            low_cut = random.choice([100, 200, 300, 500, 800])
+            high_cut = random.choice([3400, 4000, 5000, 6000, 8000])
+
+            if high_cut <= low_cut:
+                return audio
+
+            nyq = self.sample_rate / 2.0
+            low = min(low_cut / nyq, 0.99)
+            high = min(high_cut / nyq, 0.99)
+
+            if low >= high:
+                return audio
+
+            sos = butter(4, [low, high], btype='band', output='sos')
+            filtered = sosfiltfilt(sos, audio).astype(np.float32)
+            return filtered
+        except Exception:
+            return audio
     # ...existing code...
     def _augment_phase1_only(self, clean: np.ndarray):
         """

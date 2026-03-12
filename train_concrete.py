@@ -641,7 +641,7 @@ class ConcreteVoiceFixer(VoiceFixer):
                 print("[INIT] ★ 已恢复 .cuda()/.to() 原始方法")
         from torchmetrics import StructuralSimilarityIndexMeasure
         # data_range=None 会自动根据当前 batch 计算动态范围，非常省心
-        self.ssim_loss = StructuralSimilarityIndexMeasure(data_range=20.0)
+        self.ssim_loss = StructuralSimilarityIndexMeasure(data_range=15.0)
         
         self.hp = hp
         self.concrete_cfg = hp.get("concrete", {})
@@ -1063,7 +1063,7 @@ class ConcreteVoiceFixer(VoiceFixer):
             loss_ssim = 1.0 - self.ssim_loss(_gen, _tar)
             
             # L1 也稍微转一下以防万一
-            loss = 0.5 * loss_l1.float() + 0.5 * loss_ssim.float()
+            loss = 0.6 * loss_l1.float() + 0.4 * loss_ssim.float()
         
         # 记录日志
         self.log("train/loss_l1", loss_l1, on_step=False, on_epoch=True, sync_dist=True)
@@ -1725,12 +1725,6 @@ def main():
             # 3. 极其关键的拦截：切断 Lightning 自带的恢复机制
             ckpt_path = None 
             trainer_kwargs.pop("resume_from_checkpoint", None)
-            # 👇👇👇 [新增代码] 冻结疗法：保护老将，只练新兵 👇👇👇
-            print("[INFO] 正在执行冻结疗法：锁死主干网络，仅训练新加入的膨胀瓶颈层...")
-            for name, param in model.named_parameters():
-                # 只要名字里不包含 conv_block7，就全部锁死不更新！
-                if "conv_block7" not in name:
-                    param.requires_grad = False
         else:
             ckpt_path = None
         # ================================================================

@@ -69,7 +69,7 @@
 
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
-        "max_epoches": 1050,
+        "max_epoches": 200,
         "batch_size": 72,
         "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
@@ -198,21 +198,21 @@
             {
                 "_comment": "Stage 4: 全链路联合微调 - 最终质量打磨",
                 "name": "stage4_finetune",
-                "epochs": 700,
-                "phase2_intensity": 1.0,
+                "epochs": 100,
+                "phase2_intensity": 0.7,
                 "physics_config": {
-                    "jfet_gain": 1.2,
-                    "jfet_harmonic": 0.15,
-                    "emi_snr_db": [5, 20],
+                    "jfet_gain": 0.8,
+                    "jfet_harmonic": 0.1,
+                    "emi_snr_db": [10, 30],
                     "emi_freqs": [50, 1000, 2048],
                     "demod_lpf_cutoff": 4000
                 },
                 "collator_config": {
                     "cutoff_range": [1500, 2500],
-                    "apply_prob": 1.0
+                    "apply_prob": 0.85
                 },
                 "unfreeze_encoder_layers": 999,
-                "lr_scale": 0.03
+                "lr_scale": 0.15
             }
         ]
     }
