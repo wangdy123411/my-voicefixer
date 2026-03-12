@@ -77,6 +77,10 @@ class UNetResComplex_100Mb(nn.Module):
                                                  downsample=(2, 2), activation=activation, momentum=momentum)
         # 替换为全新的时间膨胀瓶颈层，打通时域任督二脉
         self.conv_block7 = DilatedTimeBottleneck(channels=384, momentum=momentum)
+
+        # 2. [新增手术点] 注入正则化，专门对付过拟合
+        self.bottleneck_dropout = nn.Dropout2d(p=0.1)  # 👈 p=0.1 是保守且有效的比例
+        
         self.decoder_block1 = DecoderBlockRes4B(in_channels=384, out_channels=384,
                                                  stride=(2, 2), activation=activation, momentum=momentum)
         self.decoder_block2 = DecoderBlockRes4B(in_channels=384, out_channels=384,
@@ -130,6 +134,7 @@ class UNetResComplex_100Mb(nn.Module):
         (x5_pool, x5) = self.encoder_block5(x4_pool)  # x5_pool: (bs, 512, T / 32, F / 32)
         (x6_pool, x6) = self.encoder_block6(x5_pool)  # x6_pool: (bs, 1024, T / 64, F / 64)
         x_center = self.conv_block7(x6_pool)  # (bs, 2048, T / 64, F / 64)
+        x_center = self.bottleneck_dropout(x_center)  # 👈 在瓶颈层后应用 Dropout 正则化
         x7 = self.decoder_block1(x_center, x6)  # (bs, 1024, T / 32, F / 32)
         x8 = self.decoder_block2(x7, x5)  # (bs, 512, T / 16, F / 16)
         x9 = self.decoder_block3(x8, x4)  # (bs, 256, T / 8, F / 8)

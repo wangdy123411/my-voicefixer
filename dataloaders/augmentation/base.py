@@ -44,7 +44,6 @@ class AudioAug:
         self.magical_effects = MagicalEffects(
             p_effects=p_effects, rir_dir=room_rir_dir
         )
-
         # ---- Phase 2: 物理链路降级 ----
         self.concrete_rir_dir = concrete_rir_dir
         self.concrete_ir_list = []
@@ -86,6 +85,9 @@ class AudioAug:
             concrete_ir_cache=self._concrete_ir_cache,
             target_sr=target_sr,
         )
+    @property
+    def concrete_physics(self):
+        return self.physics_chain
 
     def update_physics_config(self, new_config: dict):
         """

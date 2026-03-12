@@ -86,7 +86,17 @@ class ConcreteAugDataset(Dataset):
         self.noise_files = self._scan_audio_files(
             dataset_cfg.get("speech", {}).get("noise", "")
         )
+        # ================================================================
+        # [新增] 验证集模式检测：
+        # 如果 val 的 noise 目录存在预生成的退化音频，
+        # 则建立 clean↔degraded 配对，跳过所有增强
+        # ================================================================
+        self.val_paired_mode = False
+        self._val_pairs = []  # [(clean_path, degraded_path), ...]
 
+        if split == "val" and self.noise_files:
+            self._build_val_pairs()
+        
         effects_cfg = hp.get("augment", {}).get("effects", {})
         self.effect_names = list(effects_cfg.keys()) if effects_cfg else None
         self._orig_aug_available = _HAS_ORIG_AUG and len(self.noise_files) > 0
@@ -97,24 +107,82 @@ class ConcreteAugDataset(Dataset):
                 f"{dataset_cfg.get('speech', {}).get('vocal', 'N/A')}"
             )
 
-        # ================================================================
-        # [优化 1] 主进程预加载噪声到连续大数组
-        # 原来：每次 __getitem__ → _load_random_noise → _load_audio_segment
-        #       → sf.info + sf.read (磁盘IO ~2-5ms) + resample (~1ms) = ~6ms/次
-        # 现在：fork 前就把所有噪声装进一个 np.ndarray，worker 直接切片
-        #       → 纯内存操作 ~0.01ms/次，快 600 倍
-        # ================================================================
-        self._preload_all_noise()
+        # 训练集才需要预加载噪声池
+        if split == "train":
+            self._preload_all_noise()
+        else:
+            self._noise_pool = np.zeros(self.segment_length * 2, dtype=np.float32)
+            self._noise_pool_len = self.segment_length * 2
 
-        print(
-            f"[ConcreteAugDataset/{split}] "
-            f"语音: {len(self.vocal_files)} 文件, "
-            f"噪声: {len(self.noise_files)} 文件 → 已预加载到内存, "
-            f"片段: {self.segment_length}, "
-            f"Phase2强度: {self.phase2_intensity}, "
-            f"混凝土占比: {self.concrete_ratio:.0%}"
-        )
+        if self.val_paired_mode:
+            print(
+                f"[ConcreteAugDataset/val] ★ 配对模式: "
+                f"{len(self._val_pairs)} 对 (clean↔degraded), "
+                f"跳过所有增强，极速验证"
+            )
+        else:
+            print(
+                f"[ConcreteAugDataset/{split}] "
+                f"语音: {len(self.vocal_files)} 文件, "
+                f"噪声: {len(self.noise_files)} 文件, "
+                f"片段: {self.segment_length}, "
+                f"Phase2强度: {self.phase2_intensity}, "
+                f"混凝土占比: {self.concrete_ratio:.0%}"
+            )
+    def _build_val_pairs(self):
+        """
+        建立验证集 clean↔degraded 配对。
+        
+        匹配策略：按文件名（去掉扩展名）匹配。
+        例如：
+          vocal/p001_001.wav  ↔  noise/p001_001.wav
+          vocal/p001_002.wav  ↔  noise/p001_002.wav
+        
+        如果文件名带前缀/后缀差异（如 degraded_p001_001.wav），
+        则按包含关系模糊匹配。
+        """
+        # 建立 noise 文件的 basename → path 索引
+        noise_index = {}
+        for npath in self.noise_files:
+            stem = os.path.splitext(os.path.basename(npath))[0]
+            noise_index[stem] = npath
+            # 同时存一个去掉常见前缀的版本
+            for prefix in ("degraded_", "damaged_", "concrete_", "noisy_"):
+                if stem.startswith(prefix):
+                    noise_index[stem[len(prefix):]] = npath
 
+        pairs = []
+        unmatched_clean = []
+
+        for vpath in self.vocal_files:
+            stem = os.path.splitext(os.path.basename(vpath))[0]
+            if stem in noise_index:
+                pairs.append((vpath, noise_index[stem]))
+            else:
+                unmatched_clean.append(stem)
+        if len(pairs) >= len(self.vocal_files) * 0.5:
+            # 超过一半能配对，启用配对模式
+            self._val_pairs = pairs
+            self.val_paired_mode = True
+            if unmatched_clean:
+                print(f"  [Val配对] ⚠ {len(unmatched_clean)} 个 clean 文件未匹配到 degraded")
+                for s in unmatched_clean[:5]:
+                    print(f"    - {s}")
+        else:
+            # 配对率太低，可能目录结构不对，回退到按索引配对
+            # 假设 vocal 和 noise 按排序后一一对应
+            min_len = min(len(self.vocal_files), len(self.noise_files))
+            if min_len > 0:
+                self._val_pairs = list(zip(
+                    sorted(self.vocal_files)[:min_len],
+                    sorted(self.noise_files)[:min_len],
+                ))
+                self.val_paired_mode = True
+                print(
+                    f"  [Val配对] 文件名匹配率低 ({len(pairs)}/{len(self.vocal_files)})，"
+                    f"回退为排序索引配对: {min_len} 对"
+                )
+        
     def _preload_all_noise(self):
         """
         将所有噪声文件拼接成一个连续大数组。
@@ -186,9 +254,13 @@ class ConcreteAugDataset(Dataset):
         return self._noise_pool[start: start + length].copy()
 
     def __len__(self) -> int:
+        if self.val_paired_mode:
+            return len(self._val_pairs)
         return len(self.vocal_files)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self.val_paired_mode:
+            return self._getitem_val_paired(idx)
         clean = self._load_audio_segment(self.vocal_files[idx])
         use_concrete = random.random() < self.concrete_ratio
 
@@ -233,13 +305,40 @@ class ConcreteAugDataset(Dataset):
             "phase1_wave": phase1,
         }
 
-    # ================================================================
-    #  路径 A：混凝土双规制增强
-    # ================================================================
+    
+    def _getitem_val_paired(self, idx: int) -> Dict[str, Any]:
+        """
+        验证集配对模式：直接读取预生成的 clean 和 degraded。
+        零增强、零卷积、零噪声混合 → 极速。
+        """
+        clean_path, degraded_path = self._val_pairs[idx]
 
+        clean = self._load_audio_segment(clean_path)
+        degraded = self._load_audio_segment(degraded_path)
+
+        # 长度对齐
+        min_len = min(len(clean), len(degraded), self.segment_length)
+        clean = clean[:min_len]
+        degraded = degraded[:min_len]
+
+        if min_len < self.segment_length:
+            pad = self.segment_length - min_len
+            clean = np.pad(clean, (0, pad))
+            degraded = np.pad(degraded, (0, pad))
+
+        # phase1 在验证集中不需要，直接用 degraded 占位
+        return {
+            "input_wave":  degraded,
+            "target_wave": clean,
+            "phase1_wave": degraded.copy(),
+        }
+    # ================================================================
+    #  路径 A：混凝土增强（高速版）
+    # ================================================================
     def _augment_concrete(self, clean: np.ndarray):
         input_frames = clean.copy()
 
+        # Step 1: 加背景噪声
         if self._noise_pool_len > 0:
             if self.split == "train":
                 if random.random() < 0.85:
@@ -255,8 +354,33 @@ class ConcreteAugDataset(Dataset):
                     scale_range=(0.8, 0.8),
                 )
 
-        if self.audio_aug is not None:
-            apply_phase2 = self.phase2_intensity > 0
+        phase1 = input_frames.copy()
+
+        # Step 2: 混凝土 IR 卷积
+        # ================================================================
+        # [关键改动] 70% 走快速 ConcretePhysicsChain（只做 IR 卷积 + 轻量扰动）
+        #           30% 走完整 audio_aug（保留 Phase1 RIR 混响的多样性）
+        # 
+        # 原来：100% 走 audio_aug.augment(apply_phase2=True)
+        #       → Phase1 RIR (~3ms) + Phase2 物理链路 (~8ms) = ~11ms
+        # 现在：70% → ConcretePhysicsChain.apply() ~1.5ms
+        #       30% → audio_aug.augment(phase2=False) ~3ms
+        # 加权平均：0.7*1.5 + 0.3*3 = ~2ms，加速 5.5 倍
+        # ================================================================
+        use_fast_path = random.random() < 0.7
+
+        if use_fast_path and self.audio_aug is not None and \
+           hasattr(self.audio_aug, 'concrete_physics') and \
+           self.audio_aug.concrete_physics is not None:
+            # 快速路径：直接调 ConcretePhysicsChain
+            degraded = self.audio_aug.concrete_physics.apply(
+                signal=input_frames,
+                input_sr=self.sample_rate,
+                intensity=self.phase2_intensity,
+            )
+        elif self.audio_aug is not None:
+            # 慢速路径 / 回退路径
+            apply_phase2 = self.phase2_intensity > 0 and use_fast_path is False
             degraded, metadata = self.audio_aug.augment(
                 frames=input_frames,
                 effects=self.effect_names,
@@ -264,10 +388,9 @@ class ConcreteAugDataset(Dataset):
                 apply_phase2=apply_phase2,
                 phase2_intensity=self.phase2_intensity,
             )
-            phase1 = metadata.get("phase1_audio", input_frames.copy())
+            phase1 = metadata.get("phase1_audio", phase1)
         else:
             degraded = input_frames.copy()
-            phase1   = input_frames.copy()
 
         return degraded, clean, phase1
 

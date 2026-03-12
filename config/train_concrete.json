@@ -29,7 +29,7 @@
         "val_dataset": {
             "speech": {
                 "vocal": "/root/autodl-tmp/Train_set_speech/wav48/test",
-                "noise": "/root/autodl-tmp/Train_set_noise/vd_noise"
+                "noise": "/root/autodl-tmp/Val_set_concrete_static/vocal_damaged"
             }
         }
     },
@@ -70,7 +70,7 @@
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
         "max_epoches": 200,
-        "batch_size": 24,
+        "batch_size": 72,
         "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
         "lr_decay": 0.999,
@@ -85,7 +85,7 @@
         "save_top_k": 3,
         "early_stop_patience": 10,
         "detect_anomaly": false,
-        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_13/checkpoints/stage3_epoch=13-step=7383-val_loss=0.2972.ckpt"
+        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_11/checkpoints/stage3_epoch=549-step=156200-val_loss=0.2139.ckpt"
     },
 
     "log": {
@@ -122,7 +122,7 @@
 
         "optimizer": {
             "base_lr": 1e-5,
-            "weight_decay": 1e-5,
+            "weight_decay": 1e-4,
             "lr_multipliers": {
                 "encoder": 0.5,
                 "bottleneck": 0.5,
