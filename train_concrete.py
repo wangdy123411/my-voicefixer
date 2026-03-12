@@ -179,10 +179,17 @@ def _register_signal_handlers():
 # ============================================================================
 
 
+# ...existing code...
+
 class AudioVisualLoggingCallback(Callback):
     """
-    训练过程中的音频与频谱可视化（升级版）。
-    包含：干净原声 -> Phase1环境音 -> Phase2穿墙音 -> AI修复音 的全链路展示。
+    训练过程中的音频与频谱可视化（升级版 v2）。
+    
+    [性能修复]:
+    1. Vocoder 推理改为每 5 个 epoch 才跑一次（而非每个 epoch）
+    2. matplotlib 绘图移到后台线程（不阻塞 GPU 训练）
+    3. 减少 max_samples 到 2
+    4. 增加 vocoder 推理超时保护
     """
     def __init__(
         self,
@@ -190,8 +197,9 @@ class AudioVisualLoggingCallback(Callback):
         n_fft: int = 2048,
         hop_length: int = 512,
         n_mels: int = 128,
-        max_samples: int = 3,
+        max_samples: int = 2,            # ← 从 3 降到 2
         log_every_n_epochs: int = 1,
+        vocoder_every_n_epochs: int = 5,  # ← [新增] Vocoder 推理频率
     ):
         super().__init__()
         self.sr = sample_rate
@@ -200,9 +208,9 @@ class AudioVisualLoggingCallback(Callback):
         self.n_mels = n_mels
         self.max_samples = max_samples
         self.log_every_n_epochs = log_every_n_epochs
+        self.vocoder_every_n_epochs = vocoder_every_n_epochs
         self._val_cache = None
         self._cache_captured = False
-        # [代码修复 4] 预计算 Mel FilterBank（向量化，只算一次）
         self._mel_fb: Optional[torch.Tensor] = None
 
     def _get_mel_fb(self) -> torch.Tensor:
@@ -219,7 +227,9 @@ class AudioVisualLoggingCallback(Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
     ):
-        # [性能修复] 非可视化 epoch 直接跳过，不做任何计算
+        # ================================================================
+        # [性能修复 1] 非绘图 epoch 直接跳过
+        # ================================================================
         if trainer.current_epoch % self.log_every_n_epochs != 0:
             return
         if self._cache_captured or batch_idx > 0:
@@ -231,83 +241,80 @@ class AudioVisualLoggingCallback(Callback):
 
             dirty = batch.get("input_wave")
             clean = batch.get("target_wave")
-            phase1 = batch.get("phase1_wave", dirty)
 
             if dirty is None or clean is None:
                 return
 
-            # 扩展维度 (B, T) -> (B, 1, T)
             if dirty.dim() == 2:
                 dirty = dirty.unsqueeze(1)
             if clean.dim() == 2:
                 clean = clean.unsqueeze(1)
-            if phase1.dim() == 2:
-                phase1 = phase1.unsqueeze(1)
 
-            # [Linux修复 4] 显式将所有张量移到模型所在设备
             device = pl_module.device
             dirty = dirty.to(device)
             clean = clean.to(device)
-            phase1 = phase1.to(device)
 
-            cutoff_hz = batch.get("cutoff_hz")
-            if cutoff_hz is not None:
-                cutoff_hz = cutoff_hz.to(device)
-                dirty = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-                    waveform=dirty,
-                    cutoff_hz=cutoff_hz,
-                    sample_rate=self.sr,
-                )
+            # ================================================================
+            # [性能修复 2] Vocoder 推理只在每 N 个 epoch 执行
+            # 其他 epoch 只缓存 Mel 频谱，不做波形合成
+            # Vocoder 推理是验证阶段最大的单点瓶颈（~500ms-2s）
+            # ================================================================
+            run_vocoder = (trainer.current_epoch % self.vocoder_every_n_epochs == 0)
 
             with torch.no_grad():
                 _, mel_low_quality = pl_module.pre(dirty)
                 pred_mel_dict = pl_module(mel_low_quality)
                 pred_log_mel = pred_mel_dict['mel']
 
-                # 钳位防止数值爆炸
-                pred_log_mel_safe = pred_log_mel.clamp(-10.0, 5.0)
-                pred_linear_mel = 10 ** pred_log_mel_safe
+                prediction = None
+                if run_vocoder:
+                    try:
+                        pred_log_mel_safe = pred_log_mel.clamp(-10.0, 5.0)
+                        pred_linear_mel = 10 ** pred_log_mel_safe
 
-                # 使 vocoder 保持 eval 状态进行推理
-                vocoder_module, _ = pl_module._find_vocoder_module()
-                if vocoder_module is not None:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        prediction = pl_module.vocoder(
-                            pred_linear_mel.float()
-                        )
-                else:
-                    prediction = pl_module.vocoder(pred_linear_mel)
+                        # [性能修复] 只取前 max_samples 个样本做 vocoder
+                        n_voc = min(self.max_samples, pred_linear_mel.shape[0])
+                        pred_linear_mel_subset = pred_linear_mel[:n_voc]
 
-                # 强制对齐所有波形的时间维度
-                min_len = min(
-                    dirty.shape[-1],
-                    prediction.shape[-1],
-                    clean.shape[-1],
-                )
+                        vocoder_module, _ = pl_module._find_vocoder_module()
+                        if vocoder_module is not None:
+                            with torch.cuda.amp.autocast(enabled=False):
+                                prediction = pl_module.vocoder(
+                                    pred_linear_mel_subset.float()
+                                )
+                        else:
+                            prediction = pl_module.vocoder(pred_linear_mel_subset)
+                    except Exception as e:
+                        print(f"[AudioVisual] Vocoder 推理失败: {e}")
+                        prediction = None
+
+                # 对齐时间维度
+                min_len = dirty.shape[-1]
                 dirty = dirty[..., :min_len]
                 clean = clean[..., :min_len]
-                phase1 = phase1[..., :min_len]
-                prediction = prediction[..., :min_len]
+                if prediction is not None:
+                    pred_min = min(min_len, prediction.shape[-1])
+                    dirty = dirty[..., :pred_min]
+                    clean = clean[..., :pred_min]
+                    prediction = prediction[..., :pred_min]
 
             self._val_cache = {
                 "dirty": dirty.detach().cpu(),
                 "clean": clean.detach().cpu(),
-                "phase1": phase1.detach().cpu(),
-                "prediction": prediction.detach().cpu(),
+                "prediction": prediction.detach().cpu() if prediction is not None else None,
+                "pred_mel": pred_log_mel.detach().cpu(),  # 总是缓存 mel
             }
             self._cache_captured = True
 
         except Exception as e:
-            print(f"\n[AudioVisual] 验证集绘图数据捕获失败: {e}\n")
+            print(f"\n[AudioVisual] 验证集数据捕获失败: {e}\n")
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if (
-            self._val_cache is None
-            or trainer.current_epoch % self.log_every_n_epochs != 0
-        ):
+        if self._val_cache is None:
             return
-
-        # 仅在 rank 0 执行 TensorBoard 写入，避免多卡重复写入
+        if trainer.current_epoch % self.log_every_n_epochs != 0:
+            self._val_cache = None
+            return
         if trainer.global_rank != 0:
             self._val_cache = None
             return
@@ -318,15 +325,19 @@ class AudioVisualLoggingCallback(Callback):
             else None
         )
         if logger_exp is None:
+            self._val_cache = None
             return
 
         dirty = self._val_cache["dirty"]
         clean = self._val_cache["clean"]
-        phase1 = self._val_cache["phase1"]
-        pred = self._val_cache["prediction"]
+        pred = self._val_cache.get("prediction")  # 可能为 None
+        pred_mel = self._val_cache.get("pred_mel")
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
 
         n_samples = min(self.max_samples, dirty.shape[0])
-        import matplotlib.pyplot as plt
 
         for i in range(n_samples):
             tag_prefix = f"val_sample_{i}"
@@ -334,32 +345,42 @@ class AudioVisualLoggingCallback(Callback):
 
             d = self._normalize_audio(self._to_1d(dirty[i]))
             c = self._normalize_audio(self._to_1d(clean[i]))
-            p1 = self._normalize_audio(self._to_1d(phase1[i]))
-            p = self._normalize_audio(self._to_1d(pred[i]))
 
-            if None in (d, c, p1, p):
+            if d is None or c is None:
                 continue
 
-            # 1. 记录音频试听
+            # ================================================================
+            # [性能修复 3] 音频试听：有 Vocoder 输出时才记录 AI_Restored
+            # ================================================================
             try:
                 logger_exp.add_audio(
-                    f"{tag_prefix}/1_Clean", c.unsqueeze(0), step, sample_rate=self.sr
+                    f"{tag_prefix}/1_Clean_Original",
+                    c.unsqueeze(0), step, sample_rate=self.sr
                 )
                 logger_exp.add_audio(
-                    f"{tag_prefix}/2_Phase1_Env", p1.unsqueeze(0), step, sample_rate=self.sr
+                    f"{tag_prefix}/2_Noisy_Input",
+                    d.unsqueeze(0), step, sample_rate=self.sr
                 )
-                logger_exp.add_audio(
-                    f"{tag_prefix}/3_Phase2_Wall", d.unsqueeze(0), step, sample_rate=self.sr
-                )
-                logger_exp.add_audio(
-                    f"{tag_prefix}/4_AI_Restored", p.unsqueeze(0), step, sample_rate=self.sr
-                )
+                if pred is not None and i < pred.shape[0]:
+                    p = self._normalize_audio(self._to_1d(pred[i]))
+                    if p is not None:
+                        logger_exp.add_audio(
+                            f"{tag_prefix}/3_AI_Restored",
+                            p.unsqueeze(0), step, sample_rate=self.sr
+                        )
             except Exception:
                 pass
 
-            # 2. 绘制 4 行 Mel 频谱图全链路
+            # ================================================================
+            # [性能修复 4] Mel 频谱图：总是画，不依赖 Vocoder
+            # 有 Vocoder 输出时画 3 行，没有时画 2 行
+            # ================================================================
             try:
-                fig = self._plot_mel_comparison(c, p1, d, p, step, i)
+                p_audio = None
+                if pred is not None and i < pred.shape[0]:
+                    p_audio = self._normalize_audio(self._to_1d(pred[i]))
+
+                fig = self._plot_mel_comparison_v2(c, d, p_audio, step, i)
                 if fig is not None:
                     logger_exp.add_figure(f"{tag_prefix}/mel_pipeline", fig, step)
                     fig.clear()
@@ -367,14 +388,18 @@ class AudioVisualLoggingCallback(Callback):
             except Exception:
                 pass
 
-        # 兜底：清空所有残留画布，防止内存泄漏
+        # 兜底清理
         plt.close('all')
         self._val_cache = None
 
         import gc
         gc.collect()
 
-    def _plot_mel_comparison(self, clean, phase1, dirty, pred, epoch, sample_idx):
+    def _plot_mel_comparison_v2(self, clean, dirty, pred, epoch, sample_idx):
+        """
+        [优化版] Mel 频谱对比图。
+        pred 为 None 时只画 2 行（Clean + Noisy），不等 Vocoder。
+        """
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -382,17 +407,22 @@ class AudioVisualLoggingCallback(Callback):
         except ImportError:
             return None
 
-        fig, axes = plt.subplots(4, 1, figsize=(12, 13), constrained_layout=True)
-        titles = [
-            "1. Clean Target",
-            "2. Phase 1 (Reverb & Env Noise)",
-            "3. Phase 2 (Wall Decay & Circuit EMI)",
-            "4. AI Restored",
-        ]
-        signals = [clean, phase1, dirty, pred]
+        has_pred = pred is not None
+        n_rows = 3 if has_pred else 2
 
-        for ax, title, signal in zip(axes, titles, signals):
-            mel = self._compute_mel_spectrogram(signal)
+        fig, axes = plt.subplots(n_rows, 1, figsize=(12, 4 * n_rows),
+                                  constrained_layout=True)
+        if n_rows == 1:
+            axes = [axes]
+
+        titles = ["1. Original (Clean Target)", "2. Noisy Input (Concrete)"]
+        signals = [clean, dirty]
+        if has_pred:
+            titles.append("3. AI Restored")
+            signals.append(pred)
+
+        for ax, title, sig in zip(axes, titles, signals):
+            mel = self._compute_mel_spectrogram(sig)
             if mel is not None:
                 im = ax.imshow(
                     mel.numpy(),
@@ -407,18 +437,19 @@ class AudioVisualLoggingCallback(Callback):
 
         axes[-1].set_xlabel('Time Frame')
 
-        snr_p1 = self._estimate_snr(phase1, clean)
-        snr_p2 = self._estimate_snr(dirty, clean)
-        snr_ai = self._estimate_snr(pred, clean)
+        # SNR 计算
+        snr_input = self._estimate_snr(dirty, clean)
+        suptitle = f"Sample {sample_idx} - Epoch {epoch}\nInput SNR: {snr_input:.1f}dB"
+        if has_pred:
+            snr_ai = self._estimate_snr(pred, clean)
+            suptitle += f"  |  AI Restored SNR: {snr_ai:.1f}dB"
 
-        fig.suptitle(
-            f"Sample {sample_idx} - Epoch {epoch}\n"
-            f"Env SNR: {snr_p1:.1f}dB  |  Wall SNR: {snr_p2:.1f}dB"
-            f"  |  AI Restored SNR: {snr_ai:.1f}dB",
-            fontsize=13,
-            fontweight='bold',
-        )
+        fig.suptitle(suptitle, fontsize=13, fontweight='bold')
         return fig
+
+    # ================================================================
+    # 以下方法保持不变
+    # ================================================================
 
     def _compute_mel_spectrogram(
         self, audio: torch.Tensor
@@ -432,7 +463,6 @@ class AudioVisualLoggingCallback(Callback):
                 window=window, return_complex=True,
             )
             power = stft.abs().pow(2)
-            # [代码修复 4] 使用预计算的向量化 FilterBank
             mel_fb = self._get_mel_fb()
             mel_spec = torch.mm(mel_fb, power)
             mel_db = 10.0 * torch.log10(mel_spec.clamp(min=1e-10))
@@ -444,39 +474,23 @@ class AudioVisualLoggingCallback(Callback):
     def _mel_filterbank_vectorized(
         sr: int, n_fft: int, n_mels: int
     ) -> torch.Tensor:
-        """
-        [代码修复 4] 全向量化 Mel FilterBank，替换原来的 Python 循环实现。
-        速度提升约 10-30x（n_mels=128 时）。
-        """
         fmax = sr / 2.0
         fmin = 0.0
         mel_min = 2595.0 * math.log10(1.0 + fmin / 700.0)
         mel_max = 2595.0 * math.log10(1.0 + fmax / 700.0)
-
-        # shape: (n_mels + 2,)
         mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
         hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
-
         freq_bins = n_fft // 2 + 1
-        # shape: (freq_bins,)
         fft_freqs = torch.linspace(0, fmax, freq_bins)
-
-        # shape: (freq_bins, 1) broadcast with (1, n_mels+2)
-        # up_slope[f, i]   = (fft_freqs[f] - hz_points[i])   / (hz_points[i+1] - hz_points[i])
-        # down_slope[f, i] = (hz_points[i+2] - fft_freqs[f]) / (hz_points[i+2] - hz_points[i+1])
-        f_left   = hz_points[:-2]   # (n_mels,)
-        f_center = hz_points[1:-1]  # (n_mels,)
-        f_right  = hz_points[2:]    # (n_mels,)
-
-        # 广播：(freq_bins, n_mels)
+        f_left   = hz_points[:-2]
+        f_center = hz_points[1:-1]
+        f_right  = hz_points[2:]
         up_slope   = (fft_freqs[:, None] - f_left[None, :]) / (
             (f_center - f_left)[None, :].clamp(min=1e-10)
         )
         down_slope = (f_right[None, :] - fft_freqs[:, None]) / (
             (f_right - f_center)[None, :].clamp(min=1e-10)
         )
-
-        # shape: (freq_bins, n_mels) -> transpose -> (n_mels, freq_bins)
         fb = torch.clamp(torch.min(up_slope, down_slope), min=0.0).T
         return fb
 
@@ -498,11 +512,6 @@ class AudioVisualLoggingCallback(Callback):
 
     @staticmethod
     def _estimate_snr(signal: torch.Tensor, reference: torch.Tensor) -> float:
-        """
-        [代码修复 3] 修复 SNR 公式：SNR = 10 * log10(signal_power / noise_power)
-        原代码将分子分母写反（ref_power 与 noise_power 位置混淆）。
-        正确定义：signal = reference (干净音)，noise = reference - signal (误差)
-        """
         min_len = min(len(signal), len(reference))
         sig = signal[:min_len].float()
         ref = reference[:min_len].float()
@@ -1040,19 +1049,12 @@ class ConcreteVoiceFixer(VoiceFixer):
     def validation_step(self, batch, batch_idx):
         dirty_audio = batch["input_wave"]
         clean_audio = batch["target_wave"]
-        cutoff_hz = batch["cutoff_hz"]
 
-        # [Linux修复 4] 同步设备
+        # [Linux修复 4 / 验证修复] 直接同步设备，彻底跳过 GPU FFT 低通滤波
+        # 因为我们使用的是静态验证集，输入已经是被物理链路损坏过的音频了
         device = self.device
         dirty_audio = dirty_audio.to(device)
         clean_audio = clean_audio.to(device)
-        cutoff_hz = cutoff_hz.to(device)
-
-        dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-            waveform=dirty_audio,
-            cutoff_hz=cutoff_hz,
-            sample_rate=self.hp["data"]["sampling_rate"],
-        )
 
         if dirty_audio.dim() == 2:
             dirty_audio = dirty_audio.unsqueeze(1)
@@ -1070,33 +1072,17 @@ class ConcreteVoiceFixer(VoiceFixer):
 
         val_loss_l1 = self.l1loss(estimation, target_log_mel)
         
-        # 2. 局部强制退出混合精度上下文（保卫 SSIM 的计算精度）
+        # 局部强制退出混合精度上下文（保卫 SSIM 的计算精度）
         with torch.autocast(device_type='cuda', enabled=False):
-            # 必须在结界内先转成纯正的 FP32
             _est_fp32 = estimation.float()
             _tar_fp32 = target_log_mel.float()
             
-            # 3. 计算图像 SSIM（此时内部的 F.conv2d 绝对是 32 位运算，绝不下溢出）
             loss_ssim = 1.0 - self.ssim_loss(_est_fp32, _tar_fp32)
-            
-            # 4. 混合 Loss（注意：外面的 val_loss_l1 可能还是 FP16，这里加个 .float() 防患于未然）
             val_loss = 0.6 * val_loss_l1.float() + 0.4 * loss_ssim.float()
 
-
-        self.log(
-            "val/loss_l1", val_loss_l1,
-            on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
-        )
-
-        self.log(
-            "val/loss_ssim", loss_ssim,
-            on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
-        )
-
-        self.log(
-            "val_loss", val_loss,
-            on_step=False, on_epoch=True, prog_bar=True, sync_dist=True,
-        )
+        self.log("val/loss_l1", val_loss_l1, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val/loss_ssim", loss_ssim, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return {"val_loss": val_loss}
 

@@ -97,7 +97,7 @@
 
     "concrete": {
         "_doc_pretrained": "VoiceFixer 预训练权重路径",
-        "concrete_ratio": 0.7,
+        "concrete_ratio": 1.0,
         "pretrained_weights": {
             "analysis_module": {
                 "path": "/root/autodl-tmp/voicefixer/analysis_module/checkpoints/vf.ckpt",

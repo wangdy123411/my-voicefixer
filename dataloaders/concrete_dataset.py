@@ -335,6 +335,11 @@ class ConcreteAugDataset(Dataset):
     # ================================================================
     #  路径 A：混凝土增强（高速版）
     # ================================================================
+    # ...existing code...
+
+    # ================================================================
+    #  路径 A：混凝土增强（高速版）
+    # ================================================================
     def _augment_concrete(self, clean: np.ndarray):
         input_frames = clean.copy()
 
@@ -358,29 +363,24 @@ class ConcreteAugDataset(Dataset):
 
         # Step 2: 混凝土 IR 卷积
         # ================================================================
-        # [关键改动] 70% 走快速 ConcretePhysicsChain（只做 IR 卷积 + 轻量扰动）
-        #           30% 走完整 audio_aug（保留 Phase1 RIR 混响的多样性）
-        # 
-        # 原来：100% 走 audio_aug.augment(apply_phase2=True)
-        #       → Phase1 RIR (~3ms) + Phase2 物理链路 (~8ms) = ~11ms
-        # 现在：70% → ConcretePhysicsChain.apply() ~1.5ms
-        #       30% → audio_aug.augment(phase2=False) ~3ms
-        # 加权平均：0.7*1.5 + 0.3*3 = ~2ms，加速 5.5 倍
+        # [BUG修复] 属性名 concrete_physics → physics_chain
+        # base.py 第 84 行: self.physics_chain = ConcretePhysicsChain(...)
         # ================================================================
         use_fast_path = random.random() < 0.7
 
         if use_fast_path and self.audio_aug is not None and \
-           hasattr(self.audio_aug, 'concrete_physics') and \
-           self.audio_aug.concrete_physics is not None:
-            # 快速路径：直接调 ConcretePhysicsChain
-            degraded = self.audio_aug.concrete_physics.apply(
+           hasattr(self.audio_aug, 'physics_chain') and \
+           self.audio_aug.physics_chain is not None and \
+           len(getattr(self.audio_aug.physics_chain, 'ir_list', [])) > 0:
+            # 快速路径：直接调 ConcretePhysicsChain.apply()
+            degraded = self.audio_aug.physics_chain.apply(
                 signal=input_frames,
                 input_sr=self.sample_rate,
                 intensity=self.phase2_intensity,
             )
         elif self.audio_aug is not None:
-            # 慢速路径 / 回退路径
-            apply_phase2 = self.phase2_intensity > 0 and use_fast_path is False
+            # 慢速路径：走完整 audio_aug.augment()
+            apply_phase2 = self.phase2_intensity > 0 and not use_fast_path
             degraded, metadata = self.audio_aug.augment(
                 frames=input_frames,
                 effects=self.effect_names,
@@ -393,6 +393,8 @@ class ConcreteAugDataset(Dataset):
             degraded = input_frames.copy()
 
         return degraded, clean, phase1
+
+# ...existing code...
 
     # ================================================================
     #  路径 B：原始 VoiceFixer 通用增强
@@ -522,7 +524,8 @@ class ConcreteAugDataset(Dataset):
         # 高通部分：1 / sqrt(1 + (fc_low/f)^8)
         with np.errstate(divide='ignore', invalid='ignore'):
             ratio_hp = np.where(freqs > 0, low_hz / freqs, 1e6)
-        hp_resp = 1.0 / np.sqrt(1.0 + ratio_hp ** 8)
+        ratio_hp_safe = np.clip(ratio_hp, 0, 20.0) # 限制最大为 20 倍，20^8 足够大了
+        hp_resp = 1.0 / np.sqrt(1.0 + ratio_hp_safe ** 8)
 
         # 低通部分：1 / sqrt(1 + (f/fc_high)^8)
         ratio_lp = freqs / max(high_hz, 1.0)
