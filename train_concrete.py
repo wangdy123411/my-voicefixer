@@ -22,7 +22,6 @@
 import os
 # 只屏蔽 Python 级别的用户警告，不屏蔽 C++/CUDA 级别
 os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
-
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -85,13 +84,21 @@ def _parse_pl_version() -> Tuple[int, int]:
 _pl_version = _parse_pl_version()
 _USE_PL2 = _pl_version >= (2, 0)
 
-if _USE_PL2:
-    DDPStrategy = "ddp_find_unused_parameters_true"
-else:
+# =====================================================================
+# [GPU修复 2] DDPPlugin 导入：PL1 必须用 DDPPlugin 而非字符串 "ddp"
+# 字符串 "ddp" 在 PL 1.x 某些版本下会被错误解析为 DP (DataParallel)
+# =====================================================================
+_DDPPlugin = None
+if not _USE_PL2:
     try:
-        from pytorch_lightning.plugins import DDPPlugin as DDPStrategy
+        from pytorch_lightning.plugins import DDPPlugin as _DDPPlugin_cls
+        _DDPPlugin = _DDPPlugin_cls
     except ImportError:
-        DDPStrategy = None
+        try:
+            from pytorch_lightning.strategies import DDPStrategy as _DDPPlugin_cls
+            _DDPPlugin = _DDPPlugin_cls
+        except ImportError:
+            _DDPPlugin = None
 
 try:
     from pytorch_lightning.callbacks.progress import TQDMProgressBar
@@ -513,7 +520,6 @@ class AudioVisualLoggingCallback(Callback):
 #  核心：混凝土穿透语音恢复 LightningModule
 # ============================================================================
 
-# ...existing code...
 
 class ConcreteVoiceFixer(VoiceFixer):
     """
@@ -522,10 +528,19 @@ class ConcreteVoiceFixer(VoiceFixer):
 
     def __init__(self, hp: dict, channels: int = 1, type_target: str = "vocals"):
         import os
-        os.environ.setdefault("OMP_NUM_THREADS", "2")
-        os.environ.setdefault("MKL_NUM_THREADS", "2")
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+        cpu_count = os.cpu_count() or 16
+        num_workers = hp.get("train", {}).get("num_workers", 8)
+        # 每个 worker 分配的线程数 = 总核数 / (worker数 * GPU数)
+        gpu_count = max(torch.cuda.device_count() if torch.cuda.is_available() else 1, 1)
+        threads_per_worker = max(cpu_count // (num_workers * gpu_count), 1)
+        threads_str = str(threads_per_worker)
+        
+        os.environ.setdefault("OMP_NUM_THREADS", threads_str)
+        os.environ.setdefault("MKL_NUM_THREADS", threads_str)
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", threads_str)
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", threads_str)
+        print(f"[INIT] CPU 线程分配: {cpu_count} 核 / {num_workers} workers / {gpu_count} GPUs = {threads_per_worker} threads/worker")
+
 
         # ...existing code... (所有 setdefault 块保持不变)
         if "task" not in hp:
@@ -592,99 +607,48 @@ class ConcreteVoiceFixer(VoiceFixer):
 
         if _need_patch:
             # 保存原始方法
-            _orig_tensor_cuda = torch.Tensor.cuda
-            _orig_module_cuda = nn.Module.cuda
-            _orig_module_to   = nn.Module.to
+            _orig_torch_load = torch.load
+            _orig_cuda_available = torch.cuda.is_available
+            def _cpu_only_load(*args, **kwargs):
+                kwargs['map_location'] = 'cpu'
+                return _orig_torch_load(*args, **kwargs)
 
-            # Tensor.cuda() → 返回 CPU tensor（不移动）
-            def _fake_tensor_cuda(self, *args, **kwargs):
-                return self
+            torch.load = _cpu_only_load
+            torch.cuda.is_available = lambda: False
+            print("[INIT] ★ 已拦截 torch.load + cuda.is_available → 强制 CPU 初始化")
 
-            # Module.cuda() → 返回自身（不移动）
-            def _fake_module_cuda(self, *args, **kwargs):
-                return self
-
-            # Module.to() → 过滤掉 cuda 目标
-            def _safe_module_to(self, *args, **kwargs):
-                # 检查第一个参数是否为 cuda device
-                if args:
-                    arg0 = args[0]
-                    if isinstance(arg0, torch.device) and arg0.type == 'cuda':
-                        return self
-                    if isinstance(arg0, str) and 'cuda' in arg0:
-                        return self
-                if 'device' in kwargs:
-                    dev = kwargs['device']
-                    if isinstance(dev, torch.device) and dev.type == 'cuda':
-                        kwargs['device'] = 'cpu'
-                    elif isinstance(dev, str) and 'cuda' in dev:
-                        kwargs['device'] = 'cpu'
-                return _orig_module_to(self, *args, **kwargs)
-
-            # 应用 monkeypatch
-            torch.Tensor.cuda = _fake_tensor_cuda
-            nn.Module.cuda    = _fake_module_cuda
-            nn.Module.to      = _safe_module_to
-            print("[INIT] ★ 已拦截 .cuda()/.to('cuda')，强制 CPU 初始化")
-
-        # ---- 调用父类 __init__（Vocoder 会在这里被创建）----
         try:
             super().__init__(hp, channels=channels, type_target=type_target)
         finally:
-            # ================================================================
-            # [显存修复] 无论成功与否，都必须恢复原始方法
-            # ================================================================
             if _need_patch:
-                torch.Tensor.cuda = _orig_tensor_cuda
-                nn.Module.cuda    = _orig_module_cuda
-                nn.Module.to      = _orig_module_to
-                print("[INIT] ★ 已恢复 .cuda()/.to() 原始方法")
+                torch.load = _orig_torch_load
+                torch.cuda.is_available = _orig_cuda_available
+                print("[INIT] ★ 已恢复 torch.load + cuda.is_available")
+
         from torchmetrics import StructuralSimilarityIndexMeasure
-        # data_range=None 会自动根据当前 batch 计算动态范围，非常省心
         self.ssim_loss = StructuralSimilarityIndexMeasure(data_range=15.0)
-        
+
         self.hp = hp
         self.concrete_cfg = hp.get("concrete", {})
 
-        # ================================================================
-        # [显存修复] 二次确认：遍历所有子模块，强制全部回 CPU
-        # ================================================================
-        device_report = {}
-        for name, param in self.named_parameters():
-            dev = str(param.device)
-            device_report.setdefault(dev, 0)
-            device_report[dev] += param.numel()
-
-        if any('cuda' in dev for dev in device_report):
-            print(f"[INIT] ⚠ 发现参数在 GPU 上: {device_report}")
-            print("[INIT] 正在强制全部移至 CPU...")
+        # 确认所有参数在 CPU
+        gpu_params = sum(1 for p in self.parameters() if p.device.type == 'cuda')
+        if gpu_params > 0:
+            print(f"[INIT] ⚠ 发现 {gpu_params} 个 GPU 参数，强制移回 CPU")
             self.cpu()
 
-        # 显式清理所有 GPU 的 cache
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 with torch.cuda.device(i):
                     torch.cuda.empty_cache()
-
-        # 打印确认
-        final_devices = set()
-        for p in self.parameters():
-            final_devices.add(str(p.device))
-        print(f"[INIT] 所有参数设备: {final_devices}")
-
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
                 alloc = torch.cuda.memory_allocated(i) / (1024**3)
-                reserv = torch.cuda.memory_reserved(i) / (1024**3)
-                print(f"[INIT] GPU {i}: allocated={alloc:.3f}GB, reserved={reserv:.3f}GB")
+                print(f"[INIT] GPU {i}: allocated={alloc:.3f}GB (应为 0)")
 
         self._load_pretrained_weights()
         self._apply_freeze_strategy()
 
-        # 加载权重后再次确认 CPU
         for name, param in self.named_parameters():
             if param.device.type == 'cuda':
-                print(f"[INIT] ⚠ 权重加载后发现 GPU 参数: {name} on {param.device}")
                 self.cpu()
                 break
 
@@ -695,6 +659,7 @@ class ConcreteVoiceFixer(VoiceFixer):
             self._vocoder_cache = voc
             self._vocoder_name_cache = voc_name
         self._print_model_summary()
+
     def load_state_dict(self, state_dict, strict=True):
         # 强制把 strict 改为 False，让 PyTorch 放过新加的 ssim_loss 权重
         return super().load_state_dict(state_dict, strict=False)
@@ -1426,7 +1391,7 @@ def _setup_linux_nccl_env(gpu_nums: int):
     # 禁用 InfiniBand（AutoDL / 云主机通常无 IB，强制使用以太网）
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
     # P2P 传输：云环境下建议关闭（避免 PCIe 拓扑不匹配导致挂起）
-    os.environ.setdefault("NCCL_P2P_DISABLE", "0")
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
     # 等待超时（默认 30min，在慢节点上可适当延长）
     os.environ.setdefault("NCCL_TIMEOUT", "1800")
     # 关闭 NCCL 调试（生产模式）
@@ -1637,96 +1602,79 @@ def main():
         )
 
         # ================================================================
-        # [修复 1] 精度设置：为了兼容 SSIM 的极小方差计算，强制锁定 fp32
+        # [GPU修复 5] 精度：FP16 混合精度，已确认 SSIM 手动 .float()
         # ================================================================
         if torch.cuda.is_available():
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-
             if _USE_PL2:
-                # PL2: 4090 支持 bf16，优先使用
-                if gpu_mem >= 20:
-                    trainer_kwargs["precision"] = "bf16-mixed"
-                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 bf16-mixed")
-                else:
-                    trainer_kwargs["precision"] = "16-mixed"
-                    print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL2 fp16-mixed")
+                trainer_kwargs["precision"] = "bf16-mixed" if gpu_mem >= 20 else "16-mixed"
+                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → {trainer_kwargs['precision']}")
             else:
-                # PL1: 只支持 precision=16 (fp16) 或 32
-                # SSIM 已手动 .float()，混合精度安全
                 trainer_kwargs["precision"] = 16
                 trainer_kwargs["amp_backend"] = "native"
                 print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL1 fp16 混合精度")
-                print(f"        SSIM 已在代码中 .float()，无需全局 fp32")
+         # ================================================================
+        # [GPU修复 6] DDP 策略：使用 DDPPlugin 对象而非字符串
+        # 
+        # 关键修复：
+        # 1. PL1 用 DDPPlugin(find_unused_parameters=False) 对象
+        # 2. 不再区分 torchrun / 普通启动 —— PL 自己会处理
+        # 3. 删除 CUDA_VISIBLE_DEVICES hack 后，PL 能正确看到所有 GPU
         # ================================================================
-        # [修复 2] DDP Strategy：PL1 / PL2 正确的导入路径和参数
-        # ================================================================
-        if _USE_PL2:
-            if gpu_nums > 1:
-                # PL2: DDPStrategy 在 strategies 模块下
-                try:
-                    from pytorch_lightning.strategies import DDPStrategy as PL2DDPStrategy
-                except ImportError:
-                    # 某些 PL2 早期版本仍在 plugins
-                    from pytorch_lightning.plugins import DDPPlugin as PL2DDPStrategy
-
-                # 构造参数：先检测是否支持 static_graph
-                ddp_kwargs = {
-                    "find_unused_parameters": False,
-                }
-                # static_graph 和 gradient_as_bucket_view 仅 PL2.1+ 支持
-                import inspect
-                ddp_sig = inspect.signature(PL2DDPStrategy.__init__)
-                if "static_graph" in ddp_sig.parameters:
-                    ddp_kwargs["static_graph"] = True
-                if "gradient_as_bucket_view" in ddp_sig.parameters:
-                    ddp_kwargs["gradient_as_bucket_view"] = True
-
-                trainer_kwargs["strategy"] = PL2DDPStrategy(**ddp_kwargs)
+        if gpu_nums > 1:
+            if _USE_PL2:
+                trainer_kwargs["strategy"] = "ddp_find_unused_parameters_false"
                 trainer_kwargs["devices"] = gpu_nums
                 trainer_kwargs["accelerator"] = "gpu"
-                trainer_kwargs["sync_batchnorm"] = True
-                print(f"[TRAIN] PL2 DDP: {gpu_nums} GPUs, {ddp_kwargs}")
-            elif gpu_nums == 1:
+            else:
+                # PL1: 用 DDPPlugin 对象，find_unused_parameters=False（Vocoder 冻结了）
+                if _DDPPlugin is not None:
+                    trainer_kwargs["strategy"] = _DDPPlugin(
+                        find_unused_parameters=False
+                    )
+                else:
+                    trainer_kwargs["strategy"] = "ddp"
+                trainer_kwargs["gpus"] = gpu_nums
+
+            trainer_kwargs["sync_batchnorm"] = True
+            print(f"[TRAIN] 🚀 DDP: {gpu_nums} GPUs, find_unused_parameters=False")
+
+        elif gpu_nums == 1:
+            if _USE_PL2:
                 trainer_kwargs["devices"] = 1
                 trainer_kwargs["accelerator"] = "gpu"
             else:
-                trainer_kwargs["accelerator"] = "cpu"
-        else:
-            # PL1: DDPPlugin 在 plugins 模块下
-            if gpu_nums > 1:
-                trainer_kwargs["gpus"] = gpu_nums
-                try:
-                    from pytorch_lightning.plugins import DDPPlugin
-                    trainer_kwargs["strategy"] = DDPPlugin(
-                        find_unused_parameters=False
-                    )
-                except (ImportError, TypeError):
-                    trainer_kwargs["strategy"] = "ddp"
-                trainer_kwargs["sync_batchnorm"] = True
-                print(f"[TRAIN] PL1 DDP: {gpu_nums} GPUs")
-            elif gpu_nums == 1:
                 trainer_kwargs["gpus"] = 1
-
-# ...existing code...
-
-        # ================================================================
-        # [终极修复] 灵魂注入：手动加载权重，舍弃旧优化器状态！
-        # ================================================================
-        if stage_idx == START_STAGE and resume_ckpt:
-            print(f"\n[INFO] 正在强行注入巅峰权重: {resume_ckpt}")
-            print(f"[INFO] 开启 strict=False，拥抱超级感受野，彻底抛弃旧优化器！")
-            
-            # 1. 强行读取旧 Checkpoint
-            checkpoint = torch.load(resume_ckpt, map_location=lambda storage, loc: storage)
-            
-            # 2. 注入灵魂：strict=False 会完美放过我们新加的 DilatedTimeBottleneck
-            model.load_state_dict(checkpoint["state_dict"], strict=False)
-            
-            # 3. 极其关键的拦截：切断 Lightning 自带的恢复机制
-            ckpt_path = None 
-            trainer_kwargs.pop("resume_from_checkpoint", None)
         else:
-            ckpt_path = None
+            if _USE_PL2:
+                trainer_kwargs["accelerator"] = "cpu"
+
+
+       # ================================================================
+        # 智能加载机制（修复版）
+        # ================================================================
+        ckpt_path_for_fit = None  # 用于兼容新版 Lightning 的变量
+
+        if stage_idx == START_STAGE and resume_ckpt:
+            if "0.2139" in resume_ckpt:
+                # [情景 A] 初始换心手术：只拿权重，不要 Epoch
+                print(f"\n[INFO] 正在强行注入巅峰权重: {resume_ckpt}")
+                checkpoint = torch.load(resume_ckpt, map_location=lambda storage, loc: storage)
+                model.load_state_dict(checkpoint["state_dict"], strict=False)
+                
+                # 暴力抹除 Lightning 的恢复记忆
+                if "resume_from_checkpoint" in trainer_kwargs:
+                    del trainer_kwargs["resume_from_checkpoint"]
+            else:
+                # [情景 B] 正常断点续训：恢复 Epoch、优化器和权重
+                print(f"\n[INFO] 正常断点续训，完美继承进度: {resume_ckpt}")
+                trainer_kwargs["resume_from_checkpoint"] = resume_ckpt
+                ckpt_path_for_fit = resume_ckpt
+        else:
+            if "resume_from_checkpoint" in trainer_kwargs:
+                del trainer_kwargs["resume_from_checkpoint"]
+
+       
         # ================================================================
         # [调试] 打印最终 trainer_kwargs，确认精度和策略生效
         # ================================================================
@@ -1740,9 +1688,18 @@ def main():
                 print(f"  {k}: {v_str}")
         trainer = Trainer(**trainer_kwargs)
 
+    
         # [Linux修复 2] 保存 Trainer 引用供信号处理器使用
         global _trainer_ref
         _trainer_ref = trainer
+
+         # ================================================================
+        # [GPU修复 7] 确认 Trainer 实际检测到的 GPU 数
+        # ================================================================
+        if hasattr(trainer, 'num_gpus'):
+            print(f"[TRAINER] trainer.num_gpus = {trainer.num_gpus}")
+        if hasattr(trainer, 'data_parallel_device_ids'):
+            print(f"[TRAINER] device_ids = {trainer.data_parallel_device_ids}")
 
         lr_scale = stage.get("lr_scale", 1.0)
         if lr_scale != 1.0 and lr_scale > 0 and stage_idx > 0:
@@ -1754,9 +1711,9 @@ def main():
 
         dm.setup("fit")
 
-        if _USE_PL2 and ckpt_path:
-            trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path)
-        else:
+        try:
+            trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path_for_fit)
+        except TypeError:
             trainer.fit(model, datamodule=dm)
 
         stage_ckpt = os.path.join(
@@ -1766,7 +1723,6 @@ def main():
         print(f"[STAGE {stage_idx}] 完成 → {stage_ckpt}")
 
         resume_ckpt = None
-        # Stage 结束后恢复原始 LR，防止影响下一 Stage
         if lr_scale != 1.0 and lr_scale > 0 and stage_idx > 0:
             opt_cfg = hp.get("concrete", {}).get("optimizer", {})
             opt_cfg["base_lr"] = opt_cfg["base_lr"] / lr_scale

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from dataloaders.data_module import SrRandSampleRate
 from dataloaders.augmentation.base import AudioAug
 from dataloaders.collators.concrete_collator import ConcreteEavesdropCollator, ConcreteEavesdropCollatorGPU
-
+from dataloaders.concrete_dataset import ConcreteAugDataset, worker_init_fn
 
 class ConcreteDataModule(pl.LightningDataModule):
     """
@@ -155,6 +155,7 @@ class ConcreteDataModule(pl.LightningDataModule):
             persistent_workers=self.num_workers > 0,
             prefetch_factor=3 if self.num_workers > 0 else None,
             drop_last=True,
+            worker_init_fn=worker_init_fn,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -167,6 +168,7 @@ class ConcreteDataModule(pl.LightningDataModule):
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
             prefetch_factor=2 if self.num_workers > 0 else None,
+            worker_init_fn=worker_init_fn,
         )
 
     # ---- Curriculum Learning 动态更新接口 ----

@@ -70,22 +70,22 @@
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
         "max_epoches": 200,
-        "batch_size": 72,
+        "batch_size": 24,
         "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
         "lr_decay": 0.999,
         "warmup_steps": 1000,
         "input_segment_length": 132300,
         "reduce_lr_every_n_steps": 5000,
-        "check_val_every_n_epoch": 5,
-        "num_workers": 16,
+        "check_val_every_n_epoch": 2,
+        "num_workers": 12,
         "pin_memory": true,
         "persistent_workers": true,
-        "prefetch_factor": 3,
+        "prefetch_factor": 4,
         "save_top_k": 3,
-        "early_stop_patience": 25,
+        "early_stop_patience": 10,
         "detect_anomaly": false,
-        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_11/checkpoints/stage3_epoch=549-step=156200-val_loss=0.2139.ckpt"
+        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_13/checkpoints/stage3_epoch=13-step=7383-val_loss=0.2972.ckpt"
     },
 
     "log": {
@@ -212,7 +212,7 @@
                     "apply_prob": 0.85
                 },
                 "unfreeze_encoder_layers": 999,
-                "lr_scale": 0.15
+                "lr_scale": 0.05
             }
         ]
     }
