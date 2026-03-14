@@ -87,6 +87,13 @@ class ConcreteAugDataset(Dataset):
             dataset_cfg.get("speech", {}).get("noise", "")
         )
         # ================================================================
+        # [新增] 读取真实物理底噪池路径与触发概率
+        # ================================================================
+        self.concrete_noise_files = self._scan_audio_files(
+            dataset_cfg.get("speech", {}).get("concrete_noise", "")
+        )
+        self.concrete_noise_prob = concrete_cfg.get("concrete_noise_prob", 0.3) # 默认30%概率
+        # ================================================================
         # [新增] 验证集模式检测：
         # 如果 val 的 noise 目录存在预生成的退化音频，
         # 则建立 clean↔degraded 配对，跳过所有增强
@@ -110,9 +117,11 @@ class ConcreteAugDataset(Dataset):
         # 训练集才需要预加载噪声池
         if split == "train":
             self._preload_all_noise()
+            self._preload_concrete_noise()
         else:
             self._noise_pool = np.zeros(self.segment_length * 2, dtype=np.float32)
             self._noise_pool_len = self.segment_length * 2
+            self._concrete_noise_list = []
 
         if self.val_paired_mode:
             print(
@@ -252,7 +261,57 @@ class ConcreteAugDataset(Dataset):
 
         start = random.randint(0, self._noise_pool_len - length)
         return self._noise_pool[start: start + length].copy()
+    
+    def _preload_concrete_noise(self):
+        """
+        [新增] 将本地拼接好的 3s 专属物理底噪预加载为 List of Arrays。
+        因为我们已经保证了它们是 3s 的高质量音频，所以直接存成列表即可。
+        """
+        self._concrete_noise_list = []
+        if not self.concrete_noise_files:
+            return
 
+        loaded = 0
+        for path in self.concrete_noise_files:
+            try:
+                audio, sr = sf.read(path, dtype='float32', always_2d=False)
+                if audio.ndim > 1:
+                    audio = audio[:, 0]
+                if sr != self.sample_rate:
+                    audio = self._simple_resample(audio, sr, self.sample_rate)
+                # 峰值归一化防爆音
+                peak = np.max(np.abs(audio))
+                if peak > 1e-6:
+                    audio = audio / peak
+                self._concrete_noise_list.append(audio.astype(np.float32))
+                loaded += 1
+            except Exception as e:
+                continue
+                
+        if loaded > 0:
+            print(f"  [专属底噪预加载] 成功加载 {loaded} 个 3s 真实物理底噪片段！命中率设为: {self.concrete_noise_prob:.0%}")
+
+    def _load_concrete_noise(self, length: int) -> np.ndarray:
+        """
+        [新增] 从专属物理底噪池中随机抽取并裁剪出所需长度。
+        """
+        if not self._concrete_noise_list:
+            return np.zeros(length, dtype=np.float32)
+
+        # 1. 随机抽一张 3s 的“牌”
+        noise = random.choice(self._concrete_noise_list)
+
+        # 2. 如果要求的长度比 3s 还长，循环拼接补齐 (极其罕见，但保证鲁棒性)
+        if len(noise) < length:
+            repeats = (length // len(noise)) + 2
+            noise = np.tile(noise, repeats)
+
+        # 3. 随机裁剪相位 (Random Crop 增强)
+        max_start = len(noise) - length
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        
+        return noise[start : start + length].copy()
+    
     def __len__(self) -> int:
         if self.val_paired_mode:
             return len(self._val_pairs)
@@ -582,9 +641,17 @@ class ConcreteAugDataset(Dataset):
         scale_range: tuple = (0.6, 1.0),
     ):
         # ================================================================
-        # [优化 4] 用快速噪声池替代磁盘读取
+        # [优化 4: 领域自适应概率路由] 
+        # 30%概率使用含有 6000Hz 亮线的真实物理底噪，70%概率使用通用底噪
         # ================================================================
-        noise = self._load_random_noise_fast(clean.shape[0])
+        if hasattr(self, '_concrete_noise_list') and len(self._concrete_noise_list) > 0:
+            if random.random() < self.concrete_noise_prob:
+                noise = self._load_concrete_noise(clean.shape[0])
+            else:
+                noise = self._load_random_noise_fast(clean.shape[0])
+        else:
+            # 兼容没有配置真实底噪的情况
+            noise = self._load_random_noise_fast(clean.shape[0])
 
         snr_db = random.uniform(*snr_range)
         scale  = random.uniform(*scale_range)

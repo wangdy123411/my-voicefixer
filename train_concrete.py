@@ -195,7 +195,7 @@ class AudioVisualLoggingCallback(Callback):
         self,
         sample_rate: int = 44100,
         n_fft: int = 2048,
-        hop_length: int = 512,
+        hop_length: int = 441,
         n_mels: int = 128,
         max_samples: int = 2,            # ← 从 3 降到 2
         log_every_n_epochs: int = 1,
@@ -590,14 +590,14 @@ class ConcreteVoiceFixer(VoiceFixer):
         hp["model"].setdefault("loss_type", "l1")
         hp["model"].setdefault("mel_freq_bins", 128)
         hp["model"].setdefault("window_size", 2048)
-        hp["model"].setdefault("hop_size", 512)
+        hp["model"].setdefault("hop_size", 441)
         hp["model"].setdefault("pad_mode", "reflect")
         hp["model"].setdefault("window", "hann")
 
         if "mel" not in hp:
             hp["mel"] = {}
         hp["mel"].setdefault("n_fft", 2048)
-        hp["mel"].setdefault("hop_length", 512)
+        hp["mel"].setdefault("hop_length", 441)
         hp["mel"].setdefault("win_length", 2048)
         hp["mel"].setdefault("n_mels", 128)
         hp["mel"].setdefault("fmin", 0)
@@ -634,9 +634,6 @@ class ConcreteVoiceFixer(VoiceFixer):
                 torch.cuda.is_available = _orig_cuda_available
                 print("[INIT] ★ 已恢复 torch.load + cuda.is_available")
 
-        from torchmetrics import StructuralSimilarityIndexMeasure
-        self.ssim_loss = StructuralSimilarityIndexMeasure(data_range=15.0)
-
         self.hp = hp
         self.concrete_cfg = hp.get("concrete", {})
 
@@ -668,13 +665,6 @@ class ConcreteVoiceFixer(VoiceFixer):
             self._vocoder_cache = voc
             self._vocoder_name_cache = voc_name
         self._print_model_summary()
-
-    def load_state_dict(self, state_dict, strict=True):
-        # 强制把 strict 改为 False，让 PyTorch 放过新加的 ssim_loss 权重
-        return super().load_state_dict(state_dict, strict=False)
-    
-
-
 
     # ----------------------------------------------------------------
     #  预训练权重加载
@@ -1025,23 +1015,10 @@ class ConcreteVoiceFixer(VoiceFixer):
         gen_mel = gen_mel[:, :, :min_frames, :]
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
-        # 1. 正常在 autocast (FP16) 下算 L1 Loss
-        loss_l1 = self.l1loss(gen_mel, target_log_mel)
-        
-        # 2. 局部强制退出混合精度上下文！
-        # 这样 SSIM 内部的 F.conv2d 就绝对不敢再降级成 FP16 了
-        with torch.autocast(device_type='cuda', enabled=False):
-            # 注意：退出 autocast 后，必须保证输入是纯正的 FP32
-            _gen = gen_mel.float()
-            _tar = target_log_mel.float()
-            loss_ssim = 1.0 - self.ssim_loss(_gen, _tar)
-            
-            # L1 也稍微转一下以防万一
-            loss = 0.6 * loss_l1.float() + 0.4 * loss_ssim.float()
+        # 回归最纯粹的频谱能量 L1 拟合
+        loss = self.l1loss(gen_mel, target_log_mel)
         
         # 记录日志
-        self.log("train/loss_l1", loss_l1, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("train/loss_ssim", loss_ssim, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return {"loss": loss}
@@ -1070,18 +1047,8 @@ class ConcreteVoiceFixer(VoiceFixer):
         estimation = estimation[:, :, :min_frames, :]
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
-        val_loss_l1 = self.l1loss(estimation, target_log_mel)
-        
-        # 局部强制退出混合精度上下文（保卫 SSIM 的计算精度）
-        with torch.autocast(device_type='cuda', enabled=False):
-            _est_fp32 = estimation.float()
-            _tar_fp32 = target_log_mel.float()
-            
-            loss_ssim = 1.0 - self.ssim_loss(_est_fp32, _tar_fp32)
-            val_loss = 0.6 * val_loss_l1.float() + 0.4 * loss_ssim.float()
+        val_loss = self.l1loss(estimation, target_log_mel)
 
-        self.log("val/loss_l1", val_loss_l1, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("val/loss_ssim", loss_ssim, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return {"val_loss": val_loss}
@@ -1429,7 +1396,7 @@ def main():
     # [代码修复 2] 通过命令行控制起始 Stage，不再硬编码
     #cli_args = _parse_args()
     #START_STAGE = cli_args.start_stage
-    START_STAGE = 3
+    START_STAGE = 3  # 默认从 Stage 4 开始训练（0-indexed）
     # Linux 下 DataLoader 默认使用 fork，无需强制 spawn
     # 但在极少数情况下（使用 CUDA 初始化后 fork）需要改为 forkserver
     if platform.system() == "Linux":
@@ -1554,7 +1521,7 @@ def main():
             AudioVisualLoggingCallback(
                 sample_rate=hp["data"]["sampling_rate"],
                 n_fft=hp.get("mel", {}).get("n_fft", 2048),
-                hop_length=hp.get("mel", {}).get("hop_length", 512),
+                hop_length=hp.get("mel", {}).get("hop_length", 441),
                 n_mels=hp.get("mel", {}).get("n_mels", 128),
                 max_samples=hp.get("log", {}).get("visual_max_samples", 3),
                 log_every_n_epochs=hp.get("log", {}).get(

@@ -23,13 +23,14 @@
         "train_dataset": {
             "speech": {
                 "vocal": "/root/autodl-tmp/Train_set_speech/wav48/train",
-                "noise": "/root/autodl-tmp/Train_set_noise/vd_noise"
+                "noise": "/root/autodl-tmp/Train_set_noise/vd_noise",
+                "concrete_noise": "/root/autodl-tmp/Train_set_noise/Real_Noise_3s_Pool"
             }
         },
         "val_dataset": {
             "speech": {
-                "vocal": "/root/autodl-tmp/Train_set_speech/wav48/test",
-                "noise": "/root/autodl-tmp/Val_set_concrete_static/vocal_damaged"
+                "vocal": "/root/autodl-tmp/Val_set_concrete_final/clean_target",
+                "noise": "/root/autodl-tmp/Val_set_concrete_final/degraded"
             }
         }
     },
@@ -43,14 +44,14 @@
         "loss_type": "l1",
         "mel_freq_bins": 128,
         "window_size": 2048,
-        "hop_size": 512,
+        "hop_size": 441,
         "pad_mode": "reflect",
         "window": "hann"
     },
 
     "mel": {
         "n_fft": 2048,
-        "hop_length": 512,
+        "hop_length": 441,
         "win_length": 2048,
         "n_mels": 128,
         "fmin": 0,
@@ -69,7 +70,7 @@
 
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
-        "max_epoches": 200,
+        "max_epoches": 510,
         "batch_size": 72,
         "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
@@ -83,7 +84,7 @@
         "persistent_workers": true,
         "prefetch_factor": 4,
         "save_top_k": 3,
-        "early_stop_patience": 10,
+        "early_stop_patience": 50,
         "detect_anomaly": false,
         "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_11/checkpoints/stage3_epoch=549-step=156200-val_loss=0.2139.ckpt"
     },
@@ -98,6 +99,7 @@
     "concrete": {
         "_doc_pretrained": "VoiceFixer 预训练权重路径",
         "concrete_ratio": 1.0,
+        "concrete_noise_prob": 0.35,
         "pretrained_weights": {
             "analysis_module": {
                 "path": "/root/autodl-tmp/voicefixer/analysis_module/checkpoints/vf.ckpt",
@@ -160,7 +162,7 @@
             {
                 "_comment": "Stage 2: 中等 - 增加物理模拟复杂度",
                 "name": "stage2_medium",
-                "epochs": 60,
+                "epochs": 50,
                 "phase2_intensity": 0.65,
                 "physics_config": {
                     "jfet_gain": 0.6,
@@ -173,13 +175,13 @@
                     "cutoff_range": [2000, 3500],
                     "apply_prob": 0.85
                 },
-                "unfreeze_encoder_layers": 2,
-                "lr_scale": 0.8
+                "unfreeze_encoder_layers": 999,
+                "lr_scale":0.5
             },
             {
                 "_comment": "Stage 3: 困难 - 应对极端失真",
                 "name": "stage3_hard",
-                "epochs": 150,
+                "epochs": 120,
                 "phase2_intensity": 1.0,
                 "physics_config": {
                     "jfet_gain": 1.2,
@@ -189,30 +191,30 @@
                     "demod_lpf_cutoff": 4000
                 },
                 "collator_config": {
-                    "cutoff_range": [1500, 2500],
+                    "cutoff_range": [1800, 2800],
                     "apply_prob": 1.0
                 },
-                "unfreeze_encoder_layers": 6,
-                "lr_scale": 0.5
+                "unfreeze_encoder_layers": 999,
+                "lr_scale": 0.3
             },
             {
                 "_comment": "Stage 4: 全链路联合微调 - 最终质量打磨",
                 "name": "stage4_finetune",
-                "epochs": 100,
+                "epochs": 300,
                 "phase2_intensity": 0.7,
                 "physics_config": {
-                    "jfet_gain": 0.8,
-                    "jfet_harmonic": 0.1,
-                    "emi_snr_db": [10, 30],
-                    "emi_freqs": [50, 1000, 2048],
-                    "demod_lpf_cutoff": 4000
+                    "jfet_gain": 0.4,
+                    "jfet_harmonic": 0.05,
+                    "emi_snr_db": [10, 20],
+                    "emi_freqs": [50, 1000, 1950,2000,2052],
+                    "demod_lpf_cutoff": 5000
                 },
                 "collator_config": {
-                    "cutoff_range": [1500, 2500],
-                    "apply_prob": 0.85
+                    "cutoff_range": [3000, 6000],
+                    "apply_prob": 0.8
                 },
                 "unfreeze_encoder_layers": 999,
-                "lr_scale": 0.05
+                "lr_scale": 0.02
             }
         ]
     }
