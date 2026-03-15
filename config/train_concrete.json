@@ -70,7 +70,7 @@
 
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
-        "max_epoches": 510,
+        "max_epoches": 1010,
         "batch_size": 72,
         "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
@@ -84,7 +84,7 @@
         "persistent_workers": true,
         "prefetch_factor": 4,
         "save_top_k": 3,
-        "early_stop_patience": 50,
+        "early_stop_patience": 100,
         "detect_anomaly": false,
         "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_11/checkpoints/stage3_epoch=549-step=156200-val_loss=0.2139.ckpt"
     },
@@ -200,7 +200,7 @@
             {
                 "_comment": "Stage 4: 全链路联合微调 - 最终质量打磨",
                 "name": "stage4_finetune",
-                "epochs": 300,
+                "epochs": 800,
                 "phase2_intensity": 0.7,
                 "physics_config": {
                     "jfet_gain": 0.4,
@@ -214,7 +214,7 @@
                     "apply_prob": 0.8
                 },
                 "unfreeze_encoder_layers": 999,
-                "lr_scale": 0.02
+                "lr_scale": 0.2
             }
         ]
     }
