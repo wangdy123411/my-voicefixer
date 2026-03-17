@@ -192,22 +192,22 @@ def infer_and_compare(input_wav, concrete_out_wav, official_out_wav, config_path
 if __name__ == "__main__":
     # ================== AutoDL 路径配置 ==================
     # 1. 输入的音频路径
-    INPUT_WAV = "/root/autodl-tmp/Rtalk3.70_CH2_decoded.wav"
+    INPUT_WAV = "/root/autodl-tmp/Rtalk0.50_CH2_decoded.wav"
     
     # 2. 输出路径 (我们将结果存在 /root/autodl-tmp/results 目录下方便查看)
     OUT_DIR = "/root/autodl-tmp/results"
     os.makedirs(OUT_DIR, exist_ok=True)
     
-    CONCRETE_OUT_WAV = os.path.join(OUT_DIR, "Rtalk3.70_CH2_Ours.wav")
-    OFFICIAL_OUT_WAV = os.path.join(OUT_DIR, "Rtalk3.70_CH2_Baseline.wav")
-    IMG_OUT_PATH = os.path.join(OUT_DIR, "Comparison_Mel_Spectrogram3.70.png")
+    CONCRETE_OUT_WAV = os.path.join(OUT_DIR, "Rtalk0.50_CH2_Ours19.wav")
+    OFFICIAL_OUT_WAV = os.path.join(OUT_DIR, "Rtalk0.50_CH2_Baseline19.wav")
+    IMG_OUT_PATH = os.path.join(OUT_DIR, "Comparison_Mel_Spectrogram0.5019.png")
     
     # 3. 模型配置与权重
     CONFIG_FILE = "config/train_concrete.json"
     
     # ⚠️ 请确保这里的 version_X 对应你最新停掉的那次训练日志
     # 如果它是自动停止的，通常会有 last.ckpt 或者最好的 val_loss.ckpt
-    CKPT_FILE = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_14/checkpoints/stage_3_final.ckpt" 
+    CKPT_FILE = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_19/checkpoints/stage3_epoch=103-step=29535-val_loss=0.5946.ckpt" 
     # ==============================================
     
     infer_and_compare(INPUT_WAV, CONCRETE_OUT_WAV, OFFICIAL_OUT_WAV, CONFIG_FILE, CKPT_FILE, IMG_OUT_PATH)

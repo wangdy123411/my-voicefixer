@@ -372,8 +372,8 @@ class ConcreteAugDataset(Dataset):
         """
         clean_path, degraded_path = self._val_pairs[idx]
 
-        clean = self._load_audio_segment(clean_path)
-        degraded = self._load_audio_segment(degraded_path)
+        clean = self._load_audio_segment(clean_path, normalize=False)
+        degraded = self._load_audio_segment(degraded_path, normalize=False)
 
         # 长度对齐
         min_len = min(len(clean), len(degraded), self.segment_length)
@@ -667,7 +667,9 @@ class ConcreteAugDataset(Dataset):
 
         peak = np.max(np.abs(mixed))
         if peak > 0.99:
-            mixed = (mixed / peak) * 0.95
+            ratio = 0.95 / peak
+            mixed = mixed * ratio
+            clean_scaled = clean_scaled * ratio #
 
         return mixed, clean_scaled
 
@@ -687,7 +689,7 @@ class ConcreteAugDataset(Dataset):
                     files.append(os.path.join(root, fname))
         return files
 
-    def _load_audio_segment(self, filepath: str) -> np.ndarray:
+    def _load_audio_segment(self, filepath: str,normalize: bool = True) -> np.ndarray:
         try:
             info = sf.info(filepath)
             total_frames = info.frames
@@ -734,9 +736,11 @@ class ConcreteAugDataset(Dataset):
             repeats = (self.segment_length // len(audio)) + 1
             audio   = np.tile(audio, repeats)[:self.segment_length]
 
-        peak = np.max(np.abs(audio))
-        if peak > 1e-6:
-            audio = audio / peak
+        # 👈 核心修改：如果是验证集配对模式，绝对不能破坏相对音量！
+        if normalize:
+            peak = np.max(np.abs(audio))
+            if peak > 1e-6:
+                audio = audio / peak
 
         return audio.astype(np.float32)
 

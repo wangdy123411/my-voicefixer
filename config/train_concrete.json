@@ -86,13 +86,13 @@
         "save_top_k": 3,
         "early_stop_patience": 100,
         "detect_anomaly": false,
-        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_11/checkpoints/stage3_epoch=549-step=156200-val_loss=0.2139.ckpt"
+        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_18/checkpoints/last.ckpt"
     },
 
     "log": {
         "progress_bar_refresh_rate": 10,
         "log_every_n_steps": 50,
-        "visual_max_samples": 3,
+        "visual_max_samples": 6,
         "visual_every_n_epochs": 1
     },
 

@@ -178,18 +178,14 @@ def _register_signal_handlers():
 #  Task 4: Audio/Mel TensorBoard 可视化 Callback
 # ============================================================================
 
-
-# ...existing code...
-
 class AudioVisualLoggingCallback(Callback):
     """
-    训练过程中的音频与频谱可视化（升级版 v2）。
+    训练过程中的音频与频谱可视化（解封全量观测版）。
     
-    [性能修复]:
-    1. Vocoder 推理改为每 5 个 epoch 才跑一次（而非每个 epoch）
-    2. matplotlib 绘图移到后台线程（不阻塞 GPU 训练）
-    3. 减少 max_samples 到 2
-    4. 增加 vocoder 推理超时保护
+    [解封说明]:
+    1. Vocoder 推理频率改为每 1 个 epoch 跑一次（全程监控）
+    2. max_samples 提升到 6（一次看足够多的多样性样本）
+    3. 保留了底层 matplotlib 的后台绘制防溢出保护
     """
     def __init__(
         self,
@@ -197,9 +193,9 @@ class AudioVisualLoggingCallback(Callback):
         n_fft: int = 2048,
         hop_length: int = 441,
         n_mels: int = 128,
-        max_samples: int = 2,            # ← 从 3 降到 2
-        log_every_n_epochs: int = 1,
-        vocoder_every_n_epochs: int = 5,  # ← [新增] Vocoder 推理频率
+        max_samples: int = 6,            # ← [解封] 从 2 提升到 6，观测更多数据
+        log_every_n_epochs: int = 1,     # ← 每一个 Epoch 都记录
+        vocoder_every_n_epochs: int = 1, # ← [解封] 每一个 Epoch 都强制跑 Vocoder 生成音频
     ):
         super().__init__()
         self.sr = sample_rate
@@ -227,11 +223,11 @@ class AudioVisualLoggingCallback(Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
     ):
-        # ================================================================
-        # [性能修复 1] 非绘图 epoch 直接跳过
-        # ================================================================
+        # 满足日志记录周期才抓取
         if trainer.current_epoch % self.log_every_n_epochs != 0:
             return
+        
+        # 只抓取第一个验证 Batch 里的数据
         if self._cache_captured or batch_idx > 0:
             return
 
@@ -255,9 +251,7 @@ class AudioVisualLoggingCallback(Callback):
             clean = clean.to(device)
 
             # ================================================================
-            # [性能修复 2] Vocoder 推理只在每 N 个 epoch 执行
-            # 其他 epoch 只缓存 Mel 频谱，不做波形合成
-            # Vocoder 推理是验证阶段最大的单点瓶颈（~500ms-2s）
+            # [全面解封] 此时 vocoder_every_n_epochs = 1，所以每次都会为 True!
             # ================================================================
             run_vocoder = (trainer.current_epoch % self.vocoder_every_n_epochs == 0)
 
@@ -272,7 +266,7 @@ class AudioVisualLoggingCallback(Callback):
                         pred_log_mel_safe = pred_log_mel.clamp(-10.0, 5.0)
                         pred_linear_mel = 10 ** pred_log_mel_safe
 
-                        # [性能修复] 只取前 max_samples 个样本做 vocoder
+                        # 取前 max_samples (6个) 去跑 Vocoder 听音
                         n_voc = min(self.max_samples, pred_linear_mel.shape[0])
                         pred_linear_mel_subset = pred_linear_mel[:n_voc]
 
@@ -288,7 +282,7 @@ class AudioVisualLoggingCallback(Callback):
                         print(f"[AudioVisual] Vocoder 推理失败: {e}")
                         prediction = None
 
-                # 对齐时间维度
+                # 对齐时间维度防越界
                 min_len = dirty.shape[-1]
                 dirty = dirty[..., :min_len]
                 clean = clean[..., :min_len]
@@ -302,7 +296,7 @@ class AudioVisualLoggingCallback(Callback):
                 "dirty": dirty.detach().cpu(),
                 "clean": clean.detach().cpu(),
                 "prediction": prediction.detach().cpu() if prediction is not None else None,
-                "pred_mel": pred_log_mel.detach().cpu(),  # 总是缓存 mel
+                "pred_mel": pred_log_mel.detach().cpu(),
             }
             self._cache_captured = True
 
@@ -330,7 +324,7 @@ class AudioVisualLoggingCallback(Callback):
 
         dirty = self._val_cache["dirty"]
         clean = self._val_cache["clean"]
-        pred = self._val_cache.get("prediction")  # 可能为 None
+        pred = self._val_cache.get("prediction")
         pred_mel = self._val_cache.get("pred_mel")
 
         import matplotlib
@@ -349,10 +343,8 @@ class AudioVisualLoggingCallback(Callback):
             if d is None or c is None:
                 continue
 
-            # ================================================================
-            # [性能修复 3] 音频试听：有 Vocoder 输出时才记录 AI_Restored
-            # ================================================================
             try:
+                # 1. 保存原音与噪声
                 logger_exp.add_audio(
                     f"{tag_prefix}/1_Clean_Original",
                     c.unsqueeze(0), step, sample_rate=self.sr
@@ -361,6 +353,7 @@ class AudioVisualLoggingCallback(Callback):
                     f"{tag_prefix}/2_Noisy_Input",
                     d.unsqueeze(0), step, sample_rate=self.sr
                 )
+                # 2. 如果 Vocoder 合成成功，保存 AI 修复后的声音！
                 if pred is not None and i < pred.shape[0]:
                     p = self._normalize_audio(self._to_1d(pred[i]))
                     if p is not None:
@@ -371,11 +364,8 @@ class AudioVisualLoggingCallback(Callback):
             except Exception:
                 pass
 
-            # ================================================================
-            # [性能修复 4] Mel 频谱图：总是画，不依赖 Vocoder
-            # 有 Vocoder 输出时画 3 行，没有时画 2 行
-            # ================================================================
             try:
+                # 3. 画出三行频谱对比图
                 p_audio = None
                 if pred is not None and i < pred.shape[0]:
                     p_audio = self._normalize_audio(self._to_1d(pred[i]))
@@ -388,7 +378,7 @@ class AudioVisualLoggingCallback(Callback):
             except Exception:
                 pass
 
-        # 兜底清理
+        # 兜底清理内存
         plt.close('all')
         self._val_cache = None
 
@@ -397,8 +387,7 @@ class AudioVisualLoggingCallback(Callback):
 
     def _plot_mel_comparison_v2(self, clean, dirty, pred, epoch, sample_idx):
         """
-        [优化版] Mel 频谱对比图。
-        pred 为 None 时只画 2 行（Clean + Noisy），不等 Vocoder。
+        三行比对频谱图绘制。
         """
         try:
             import matplotlib
@@ -411,7 +400,7 @@ class AudioVisualLoggingCallback(Callback):
         n_rows = 3 if has_pred else 2
 
         fig, axes = plt.subplots(n_rows, 1, figsize=(12, 4 * n_rows),
-                                  constrained_layout=True)
+                                 constrained_layout=True)
         if n_rows == 1:
             axes = [axes]
 
@@ -437,7 +426,7 @@ class AudioVisualLoggingCallback(Callback):
 
         axes[-1].set_xlabel('Time Frame')
 
-        # SNR 计算
+        # 估算并标注 SNR
         snr_input = self._estimate_snr(dirty, clean)
         suptitle = f"Sample {sample_idx} - Epoch {epoch}\nInput SNR: {snr_input:.1f}dB"
         if has_pred:
@@ -1527,6 +1516,7 @@ def main():
                 log_every_n_epochs=hp.get("log", {}).get(
                     "visual_every_n_epochs", 1
                 ),
+                vocoder_every_n_epochs=1,
             ),
         ]
 
