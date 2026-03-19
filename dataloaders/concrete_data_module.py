@@ -96,21 +96,21 @@ class ConcreteDataModule(pl.LightningDataModule):
             apply_prob=col_cfg.get("apply_prob", 0.9),
         )
         
-        # 验证集：消除随机性，采用固定的中等难度评估基准 (如统一滤到 3000Hz)
+        # 👇 修复 1：验证集也必须用 GPU Collator，并强制锁死在 Stage 4 满级难度！
+        stage4_cfg = self.hp["concrete"]["curriculum_stages"][-1]
+        cutoff_mean = sum(stage4_cfg["collator_config"]["cutoff_range"]) / 2.0
+        
         val_collator = ConcreteEavesdropCollatorGPU(
             sample_rate=self.sample_rate,
-            cutoff_range=(3000.0, 3000.0),  # 上下界一致，强制固定截止频率
+            cutoff_range=(cutoff_mean, cutoff_mean),  # 上下界一致，强制固定截止频率 (平均值)
             filter_order=col_cfg.get("filter_order", 8),
-            apply_prob=1.0,                 # 100%触发，确保每个Epoch评估标准绝对统一
+            apply_prob=1.0,  # 100%触发，不留任何随机后门
         )
         
         return train_collator, val_collator
 
     def setup(self, stage: Optional[str] = None):
-        """
-        初始化数据集。
-        在 PL 的 fit/test 之前被调用。
-        """
+        """初始化数据集"""
         if stage == "fit" or stage is None:
             from dataloaders.concrete_dataset import ConcreteAugDataset
 
@@ -120,23 +120,22 @@ class ConcreteDataModule(pl.LightningDataModule):
                 audio_aug=self.audio_aug,
                 phase2_intensity=self.phase2_intensity,
             )
+            
+            stage4_cfg = self.hp["concrete"]["curriculum_stages"][-1]
             self.val_dataset = ConcreteAugDataset(
                 hp=self.hp,
                 split="val",
-                audio_aug=self.audio_aug,
-                phase2_intensity=0.0,  # 验证集不施加 Phase 2
+                audio_aug=self.audio_aug,  
+                phase2_intensity=stage4_cfg["phase2_intensity"]
+                # 👈 删除了这里报错的 val_paired_mode=False
             )
 
-            # ---- 校验 ----
             if len(self.train_dataset) == 0:
                 raise RuntimeError("训练集为空，请检查 data.train_dataset 配置路径")
             if len(self.val_dataset) == 0:
                 warnings.warn("验证集为空，将跳过验证步骤")
 
-            print(
-                f"[ConcreteDataModule] 数据集就绪: "
-                f"train={len(self.train_dataset)}, val={len(self.val_dataset)}"
-            )
+            print(f"[ConcreteDataModule] 数据集就绪: train={len(self.train_dataset)}, val={len(self.val_dataset)}")
 
     def train_dataloader(self) -> DataLoader:
         sampler = None
@@ -158,19 +157,22 @@ class ConcreteDataModule(pl.LightningDataModule):
             worker_init_fn=worker_init_fn,
         )
 
-    def val_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=max(self.num_workers // 2, 1),
-            collate_fn=self.val_collator,
-            pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-            prefetch_factor=2 if self.num_workers > 0 else None,
-            worker_init_fn=worker_init_fn,
-        )
+    def val_dataloader(self):
+        from torch.utils.data import DataLoader
 
+        print("\n🚀 [警告] 正在启动 100% 全动态验证管道！物理参数与 FFT 截断已对齐满级 (Stage 4)！")
+
+        val_batch_size = max(1, self.hp["train"]["batch_size"] // 2)
+
+        return DataLoader(
+            self.val_dataset,  # 👈 直接使用 setup 中初始化好的数据集
+            batch_size=val_batch_size,
+            shuffle=False, 
+            num_workers=self.hp["train"]["num_workers"],
+            collate_fn=self.val_collator,  
+            pin_memory=True,
+            drop_last=False
+        )
     # ---- Curriculum Learning 动态更新接口 ----
 
     def update_physics_config(self, new_config: dict):

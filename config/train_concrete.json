@@ -29,8 +29,9 @@
         },
         "val_dataset": {
             "speech": {
-                "vocal": "/root/autodl-tmp/Val_set_concrete_final/clean_target",
-                "noise": "/root/autodl-tmp/Val_set_concrete_final/degraded"
+                "vocal": "/root/autodl-tmp/Train_set_speech/wav48/test",  
+                "noise": "/root/autodl-tmp/Train_set_noise/vd_noise",    
+                "concrete_noise": "/root/autodl-tmp/Train_set_noise/Real_Noise_3s_Pool" 
             }
         }
     },
@@ -84,9 +85,9 @@
         "persistent_workers": true,
         "prefetch_factor": 4,
         "save_top_k": 3,
-        "early_stop_patience": 100,
+        "early_stop_patience": 1000,
         "detect_anomaly": false,
-        "resume_from_checkpoint":"/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_18/checkpoints/last.ckpt"
+        "resume_from_checkpoint":null
     },
 
     "log": {

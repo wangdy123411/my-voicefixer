@@ -60,6 +60,7 @@ class ConcreteAugDataset(Dataset):
         split: str = "train",
         audio_aug: Optional[AudioAug] = None,
         phase2_intensity: float = 0.5,
+        val_paired_mode: bool = False,  # 👈 修复：正式加入签名，默认 False，彻底关掉配对！
     ):
         super().__init__()
         self.hp = hp
@@ -86,22 +87,21 @@ class ConcreteAugDataset(Dataset):
         self.noise_files = self._scan_audio_files(
             dataset_cfg.get("speech", {}).get("noise", "")
         )
-        # ================================================================
-        # [新增] 读取真实物理底噪池路径与触发概率
-        # ================================================================
         self.concrete_noise_files = self._scan_audio_files(
             dataset_cfg.get("speech", {}).get("concrete_noise", "")
         )
-        self.concrete_noise_prob = concrete_cfg.get("concrete_noise_prob", 0.3) # 默认30%概率
-        # ================================================================
-        # [新增] 验证集模式检测：
-        # 如果 val 的 noise 目录存在预生成的退化音频，
-        # 则建立 clean↔degraded 配对，跳过所有增强
-        # ================================================================
-        self.val_paired_mode = False
-        self._val_pairs = []  # [(clean_path, degraded_path), ...]
+        self.concrete_noise_prob = concrete_cfg.get("concrete_noise_prob", 0.3) 
 
-        if split == "val" and self.noise_files:
+        # ================================================================
+        # 💥 [终极修复] 强制切断有毒的后路！
+        # 只有外部明确传入 val_paired_mode=True 时，才允许尝试配对！
+        # 否则 100% 走我们想要的动态在线抽卡！
+        # ================================================================
+        self.val_paired_mode = val_paired_mode
+        self._val_pairs = []
+
+        # 修改判定条件：加上 self.val_paired_mode 的约束
+        if split == "val" and self.val_paired_mode and self.noise_files:
             self._build_val_pairs()
         
         effects_cfg = hp.get("augment", {}).get("effects", {})
@@ -124,19 +124,15 @@ class ConcreteAugDataset(Dataset):
             self._concrete_noise_list = []
 
         if self.val_paired_mode:
-            print(
-                f"[ConcreteAugDataset/val] ★ 配对模式: "
-                f"{len(self._val_pairs)} 对 (clean↔degraded), "
-                f"跳过所有增强，极速验证"
-            )
+            print(f"[ConcreteAugDataset/val] ★ 配对模式: {len(self._val_pairs)} 对, 跳过增强")
         else:
             print(
                 f"[ConcreteAugDataset/{split}] "
-                f"语音: {len(self.vocal_files)} 文件, "
-                f"噪声: {len(self.noise_files)} 文件, "
+                f"语音: {len(self.vocal_files)}文件, "
+                f"噪声: {len(self.noise_files)}文件, "
                 f"片段: {self.segment_length}, "
-                f"Phase2强度: {self.phase2_intensity}, "
-                f"混凝土占比: {self.concrete_ratio:.0%}"
+                f"Phase2: {self.phase2_intensity}, "
+                f"混凝土: {self.concrete_ratio:.0%}"
             )
     def _build_val_pairs(self):
         """
@@ -394,11 +390,6 @@ class ConcreteAugDataset(Dataset):
     # ================================================================
     #  路径 A：混凝土增强（高速版）
     # ================================================================
-    # ...existing code...
-
-    # ================================================================
-    #  路径 A：混凝土增强（高速版）
-    # ================================================================
     def _augment_concrete(self, clean: np.ndarray):
         input_frames = clean.copy()
 
@@ -452,8 +443,6 @@ class ConcreteAugDataset(Dataset):
             degraded = input_frames.copy()
 
         return degraded, clean, phase1
-
-# ...existing code...
 
     # ================================================================
     #  路径 B：原始 VoiceFixer 通用增强

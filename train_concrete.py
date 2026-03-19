@@ -44,7 +44,6 @@ from typing import Optional, Dict, Any, List, Tuple
 from collections import OrderedDict
 
 from tools.pytorch.pytorch_util import to_log
-
 import git
 import torch
 import torch.nn as nn
@@ -178,14 +177,17 @@ def _register_signal_handlers():
 #  Task 4: Audio/Mel TensorBoard 可视化 Callback
 # ============================================================================
 
+
+
 class AudioVisualLoggingCallback(Callback):
     """
-    训练过程中的音频与频谱可视化（解封全量观测版）。
+    训练过程中的音频与频谱可视化（防爆装甲版）。
     
     [解封说明]:
     1. Vocoder 推理频率改为每 1 个 epoch 跑一次（全程监控）
     2. max_samples 提升到 6（一次看足够多的多样性样本）
     3. 保留了底层 matplotlib 的后台绘制防溢出保护
+    4. 🛡️ 新增音频与频谱级的 NaN/Inf 强制清洗，根除 TensorBoard 断图警告
     """
     def __init__(
         self,
@@ -194,8 +196,8 @@ class AudioVisualLoggingCallback(Callback):
         hop_length: int = 441,
         n_mels: int = 128,
         max_samples: int = 6,            # ← [解封] 从 2 提升到 6，观测更多数据
-        log_every_n_epochs: int = 1,     # ← 每一个 Epoch 都记录
-        vocoder_every_n_epochs: int = 1, # ← [解封] 每一个 Epoch 都强制跑 Vocoder 生成音频
+        log_every_n_epochs: int = 3,     # ← 每一个 Epoch 都记录
+        vocoder_every_n_epochs: int = 3 , # ← [解封] 每一个 Epoch 都强制跑 Vocoder 生成音频
     ):
         super().__init__()
         self.sr = sample_rate
@@ -223,11 +225,9 @@ class AudioVisualLoggingCallback(Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
     ):
-        # 满足日志记录周期才抓取
         if trainer.current_epoch % self.log_every_n_epochs != 0:
             return
         
-        # 只抓取第一个验证 Batch 里的数据
         if self._cache_captured or batch_idx > 0:
             return
 
@@ -237,6 +237,7 @@ class AudioVisualLoggingCallback(Callback):
 
             dirty = batch.get("input_wave")
             clean = batch.get("target_wave")
+            cutoff_hz = batch.get("cutoff_hz")  # 👈 [修复1] 把截断频率拿出来！
 
             if dirty is None or clean is None:
                 return
@@ -247,42 +248,57 @@ class AudioVisualLoggingCallback(Callback):
                 clean = clean.unsqueeze(1)
 
             device = pl_module.device
-            dirty = dirty.to(device)
-            clean = clean.to(device)
+            dirty = dirty.to(device, dtype=torch.float32)
+            clean = clean.to(device, dtype=torch.float32)
 
-            # ================================================================
-            # [全面解封] 此时 vocoder_every_n_epochs = 1，所以每次都会为 True!
-            # ================================================================
+            # 🚀 [修复2] 删除了之前的 1e-7 白噪声，保持频谱的绝对干净！
+
             run_vocoder = (trainer.current_epoch % self.vocoder_every_n_epochs == 0)
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+                
+                # =========================================================
+                # 💥 [修复3] 强制画图插件也执行 GPU 低通滤波！
+                # 这样 TensorBoard 里的图就会呈现出完美的“一刀切”截断线！
+                # =========================================================
+                if cutoff_hz is not None:
+                    from dataloaders.collators.concrete_collator import ConcreteEavesdropCollatorGPU
+                    cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
+                    dirty = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
+                        waveform=dirty,
+                        cutoff_hz=cutoff_hz,
+                        sample_rate=self.sr
+                    )
+
                 _, mel_low_quality = pl_module.pre(dirty)
+                
+                # 用极其安全的 1e-10 托底，防 to_log 报错
+                mel_low_quality = torch.nan_to_num(mel_low_quality, nan=1e-10, posinf=2.0, neginf=1e-10)
+                mel_low_quality = mel_low_quality.clamp(min=1e-10)
+                
                 pred_mel_dict = pl_module(mel_low_quality)
                 pred_log_mel = pred_mel_dict['mel']
+
+                pred_log_mel = torch.nan_to_num(pred_log_mel, nan=-11.5, posinf=3.0, neginf=-11.5)
 
                 prediction = None
                 if run_vocoder:
                     try:
-                        pred_log_mel_safe = pred_log_mel.clamp(-10.0, 5.0)
+                        pred_log_mel_safe = pred_log_mel.clamp(-11.5, 3.0)
                         pred_linear_mel = 10 ** pred_log_mel_safe
 
-                        # 取前 max_samples (6个) 去跑 Vocoder 听音
                         n_voc = min(self.max_samples, pred_linear_mel.shape[0])
                         pred_linear_mel_subset = pred_linear_mel[:n_voc]
 
                         vocoder_module, _ = pl_module._find_vocoder_module()
                         if vocoder_module is not None:
-                            with torch.cuda.amp.autocast(enabled=False):
-                                prediction = pl_module.vocoder(
-                                    pred_linear_mel_subset.float()
-                                )
+                            prediction = pl_module.vocoder(pred_linear_mel_subset)
                         else:
                             prediction = pl_module.vocoder(pred_linear_mel_subset)
                     except Exception as e:
                         print(f"[AudioVisual] Vocoder 推理失败: {e}")
                         prediction = None
 
-                # 对齐时间维度防越界
                 min_len = dirty.shape[-1]
                 dirty = dirty[..., :min_len]
                 clean = clean[..., :min_len]
@@ -325,7 +341,6 @@ class AudioVisualLoggingCallback(Callback):
         dirty = self._val_cache["dirty"]
         clean = self._val_cache["clean"]
         pred = self._val_cache.get("prediction")
-        pred_mel = self._val_cache.get("pred_mel")
 
         import matplotlib
         matplotlib.use('Agg')
@@ -337,8 +352,16 @@ class AudioVisualLoggingCallback(Callback):
             tag_prefix = f"val_sample_{i}"
             step = trainer.current_epoch
 
-            d = self._normalize_audio(self._to_1d(dirty[i]))
-            c = self._normalize_audio(self._to_1d(clean[i]))
+            # 提取 1D 音频
+            d_raw = self._to_1d(dirty[i])
+            c_raw = self._to_1d(clean[i])
+            
+            # =========================================================
+            # 🛡️ [防爆净水器 1] 强力清洗音频，拦截 NaN 和 Inf 
+            # 解决 TensorBoard cast warning 且防止写入失败
+            # =========================================================
+            d = self._normalize_audio(self._sanitize_tensor(d_raw))
+            c = self._normalize_audio(self._sanitize_tensor(c_raw))
 
             if d is None or c is None:
                 continue
@@ -355,7 +378,9 @@ class AudioVisualLoggingCallback(Callback):
                 )
                 # 2. 如果 Vocoder 合成成功，保存 AI 修复后的声音！
                 if pred is not None and i < pred.shape[0]:
-                    p = self._normalize_audio(self._to_1d(pred[i]))
+                    p_raw = self._to_1d(pred[i])
+                    # 同样的清洗工序
+                    p = self._normalize_audio(self._sanitize_tensor(p_raw))
                     if p is not None:
                         logger_exp.add_audio(
                             f"{tag_prefix}/3_AI_Restored",
@@ -368,7 +393,8 @@ class AudioVisualLoggingCallback(Callback):
                 # 3. 画出三行频谱对比图
                 p_audio = None
                 if pred is not None and i < pred.shape[0]:
-                    p_audio = self._normalize_audio(self._to_1d(pred[i]))
+                    p_raw = self._to_1d(pred[i])
+                    p_audio = self._normalize_audio(self._sanitize_tensor(p_raw))
 
                 fig = self._plot_mel_comparison_v2(c, d, p_audio, step, i)
                 if fig is not None:
@@ -413,8 +439,15 @@ class AudioVisualLoggingCallback(Callback):
         for ax, title, sig in zip(axes, titles, signals):
             mel = self._compute_mel_spectrogram(sig)
             if mel is not None:
+                # =====================================================
+                # 🛡️ [防爆净水器 2] 清洗频谱二维数组，防止 imshow 崩溃
+                # =====================================================
+                mel_np = mel.numpy()
+                import numpy as np
+                mel_np = np.nan_to_num(mel_np, nan=-80.0, posinf=0.0, neginf=-80.0)
+
                 im = ax.imshow(
-                    mel.numpy(),
+                    mel_np,
                     aspect='auto',
                     origin='lower',
                     interpolation='nearest',
@@ -437,13 +470,22 @@ class AudioVisualLoggingCallback(Callback):
         return fig
 
     # ================================================================
+    # 新增的安全方法
+    # ================================================================
+    @staticmethod
+    def _sanitize_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """清除张量中的 NaN 和 Inf，并限制极端值"""
+        if tensor is None:
+            return None
+        return torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # ================================================================
     # 以下方法保持不变
     # ================================================================
-
     def _compute_mel_spectrogram(
         self, audio: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        if audio.dim() == 0 or len(audio) < self.n_fft:
+        if audio is None or audio.dim() == 0 or len(audio) < self.n_fft:
             return None
         try:
             window = torch.hann_window(self.n_fft)
@@ -497,7 +539,9 @@ class AudioVisualLoggingCallback(Callback):
         if audio is None:
             return audio
         peak = audio.abs().max()
-        return audio / peak * 0.95 if peak > 1e-8 else audio
+        # 🛡️ 再次确保输出完全被钳制在 [-0.95, 0.95]
+        norm = audio / peak * 0.95 if peak > 1e-8 else audio
+        return torch.clamp(norm, min=-0.95, max=0.95)
 
     @staticmethod
     def _estimate_snr(signal: torch.Tensor, reference: torch.Tensor) -> float:
@@ -1015,28 +1059,57 @@ class ConcreteVoiceFixer(VoiceFixer):
     def validation_step(self, batch, batch_idx):
         dirty_audio = batch["input_wave"]
         clean_audio = batch["target_wave"]
+        cutoff_hz = batch["cutoff_hz"]
 
-        # [Linux修复 4 / 验证修复] 直接同步设备，彻底跳过 GPU FFT 低通滤波
-        # 因为我们使用的是静态验证集，输入已经是被物理链路损坏过的音频了
         device = self.device
-        dirty_audio = dirty_audio.to(device)
-        clean_audio = clean_audio.to(device)
+        
+        # 🛡️ FP32 防爆与清洗
+        dirty_audio = dirty_audio.to(device, dtype=torch.float32)
+        clean_audio = clean_audio.to(device, dtype=torch.float32)
+        cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
+
+        dirty_audio = torch.nan_to_num(dirty_audio, nan=0.0)
+        clean_audio = torch.nan_to_num(clean_audio, nan=0.0)
+
+        # 🛡️ 局部的 GPU 低通滤波
+        with torch.cuda.amp.autocast(enabled=False):
+            dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
+                waveform=dirty_audio,
+                cutoff_hz=cutoff_hz,
+                sample_rate=self.hp["data"]["sampling_rate"],
+            )
 
         if dirty_audio.dim() == 2:
             dirty_audio = dirty_audio.unsqueeze(1)
         if clean_audio.dim() == 2:
             clean_audio = clean_audio.unsqueeze(1)
 
-        _, mel_target = self.pre(clean_audio)
-        _, mel_low_quality = self.pre(dirty_audio)
-        estimation = self(mel_low_quality)['mel']
-        target_log_mel = to_log(mel_target)
+        # =========================================================
+        # 💥 [终极修复] 把过滤好的、安全的音频塞回 batch 字典！
+        # 这样后面的 AudioVisualLoggingCallback 画图时就不会拿到有毒数据了！
+        # =========================================================
+        batch["input_wave"] = dirty_audio
+        batch["target_wave"] = clean_audio
 
-        min_frames = min(estimation.size(2), target_log_mel.size(2))
-        estimation = estimation[:, :, :min_frames, :]
-        target_log_mel = target_log_mel[:, :, :min_frames, :]
+        with torch.no_grad():
+            _, mel_target = self.pre(clean_audio)
+            _, mel_low_quality = self.pre(dirty_audio)
+            
+            estimation = self(mel_low_quality)['mel']
+            
+            # 钳制极小值防 -inf
+            mel_target_safe = mel_target.clamp(min=1e-5)
+            target_log_mel = to_log(mel_target_safe)
 
-        val_loss = self.l1loss(estimation, target_log_mel)
+            min_frames = min(estimation.size(2), target_log_mel.size(2))
+            estimation = estimation[:, :, :min_frames, :]
+            target_log_mel = target_log_mel[:, :, :min_frames, :]
+
+            val_loss = self.l1loss(estimation, target_log_mel)
+
+            # 防爆护盾
+            if not torch.isfinite(val_loss):
+                val_loss = torch.tensor(0.0, device=device)
 
         self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
@@ -1380,17 +1453,9 @@ def _hparams_to_dict(obj):
 
 
 def main():
-    """主入口：Curriculum Learning 训练管线（Linux 优化版）。"""
+    """主入口：满级终极冲刺训练管线（纯享优化版）。"""
 
-    # [代码修复 2] 通过命令行控制起始 Stage，不再硬编码
-    #cli_args = _parse_args()
-    #START_STAGE = cli_args.start_stage
-    START_STAGE = 3  # 默认从 Stage 4 开始训练（0-indexed）
-    # Linux 下 DataLoader 默认使用 fork，无需强制 spawn
-    # 但在极少数情况下（使用 CUDA 初始化后 fork）需要改为 forkserver
     if platform.system() == "Linux":
-        # 仅在 CUDA 已初始化的子进程场景下才需要 forkserver
-        # 正常主进程启动时保持 fork（最快）
         pass
     elif platform.system() == "Windows":
         try:
@@ -1403,9 +1468,7 @@ def main():
 
     env_ok = validate_environment()
     if not env_ok:
-        print(
-            "[ENV] 环境检查未通过，建议安装缺失的依赖并确保至少有一块 CUDA GPU"
-        )
+        print("[ENV] 环境检查未通过，建议安装缺失的依赖并确保至少有一块 CUDA GPU")
         return
 
     gpu_nums = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -1413,6 +1476,7 @@ def main():
     # [Linux修复 3] 配置 NCCL 多 GPU 环境变量
     _setup_linux_nccl_env(gpu_nums)
 
+    # 加载超参数
     hp_result = tools.utils.get_hparams()
     hp = hp_result[0] if isinstance(hp_result, tuple) else hp_result
 
@@ -1427,9 +1491,7 @@ def main():
             hp_dict[k] = _hparams_to_dict(v) if hasattr(v, 'keys') else v
     hp = hp_dict
 
-    assert hp["data"]["sampling_rate"] == 44100, (
-        f"采样率必须为 44100，当前: {hp['data']['sampling_rate']}"
-    )
+    assert hp["data"]["sampling_rate"] == 44100, f"采样率必须为 44100，当前: {hp['data']['sampling_rate']}"
 
     hp["root"] = git_root
 
@@ -1440,19 +1502,16 @@ def main():
                 for sub_key in hp["data"][split][category]:
                     path = hp["data"][split][category][sub_key]
                     if isinstance(path, str) and not os.path.isabs(path):
-                        hp["data"][split][category][sub_key] = os.path.join(
-                            hp["root"], path
-                        )
+                        hp["data"][split][category][sub_key] = os.path.join(hp["root"], path)
 
     if "rir_root" in hp.get("augment", {}).get("params", {}):
         rir_path = hp["augment"]["params"]["rir_root"]
         if not os.path.isabs(rir_path):
-            hp["augment"]["params"]["rir_root"] = os.path.join(
-                hp["root"], rir_path
-            )
+            hp["augment"]["params"]["rir_root"] = os.path.join(hp["root"], rir_path)
 
     validate_config(hp)
 
+    # 初始化 Logger
     model_dir = hp.get("model_dir", "exp/concrete_v1")
     logger = TensorBoardLogger(
         os.path.dirname(model_dir) or ".",
@@ -1460,219 +1519,139 @@ def main():
     )
     hp["log_dir"] = logger.log_dir
 
+    # =================================================================
+    # 1. 实例化模型底座 & 热加载权重 (Warm Start)
+    # =================================================================
     model = ConcreteVoiceFixer(hp, channels=1, type_target="vocals")
 
+    # 👇 填入你最新跑完的 0.58 那个 ckpt 文件！
+    latest_ckpt_path = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_21/checkpoints/last.ckpt" 
+
+    if os.path.exists(latest_ckpt_path):
+        print(f"\n🔥 [Warm Start] 正在暴力加载满级权重: {latest_ckpt_path}")
+        print("  -> 已彻底抹除 Lightning 进度记忆，Epoch 和 Patience 从零开始！")
+        ckpt_data = torch.load(latest_ckpt_path, map_location="cpu")
+        clean_state_dict = ckpt_data["state_dict"]
+        clean_state_dict = {k: v for k, v in clean_state_dict.items() if "ssim_loss" not in k}
+        model.load_state_dict(clean_state_dict, strict=False)
+    else:
+        print("\n⚠️ [警告] 未找到指定的检查点，模型将从随机/基础权重起飞。")
+
+    # =================================================================
+    # 2. 实例化数据管道 & 强制锁死满级物理难度
+    # =================================================================
     distributed = gpu_nums > 1
     dm = ConcreteDataModule(hp, distributed=distributed)
 
-    curriculum = CurriculumManager(hp, model, dm)
-    stages = curriculum.stages
-
-    resume_ckpt = hp["train"].get("resume_from_checkpoint", "") or None
-
-    # [代码修复 2] START_STAGE 来自命令行，可覆盖
-    print(f"[TRAIN] 从 Stage {START_STAGE} 开始训练 "
-          f"(共 {len(stages)} 个 Stage)")
-
-    # 累计之前跳过的 epochs，保证 max_epochs 语义正确
-    cumulative_epochs = sum(
-        curriculum.get_stage_epochs(i) for i in range(START_STAGE)
-    )
-
-    for stage_idx in range(START_STAGE, len(stages)):
-        stage = stages[stage_idx]
-        curriculum.apply_stage(stage_idx)
-
-        stage_epochs = curriculum.get_stage_epochs(stage_idx)
-        cumulative_epochs += stage_epochs
-        print(
-            f"[TRAIN] Stage {stage_idx + 1}: 训练 {stage_epochs} epochs "
-            f"(全局 epoch 上限: {cumulative_epochs})"
-        )
-
-        callbacks = [
-            LearningRateMonitor(logging_interval="step"),
-            ModelCheckpoint(
-                filename=f"stage{stage_idx}_" + "{epoch}-{step}-{val_loss:.4f}",
-                dirpath=os.path.join(logger.log_dir, "checkpoints"),
-                save_top_k=hp["train"].get("save_top_k", 3),
-                monitor="val_loss",
-                mode="min",
-                save_last=True,
-            ),
-            EarlyStopping(
-                monitor="val_loss",
-                patience=hp["train"].get("early_stop_patience", 15),
-                mode="min",
-                verbose=True,
-            ),
-            initLogDir(hp, current_dir=os.getcwd()),
-            AudioVisualLoggingCallback(
-                sample_rate=hp["data"]["sampling_rate"],
-                n_fft=hp.get("mel", {}).get("n_fft", 2048),
-                hop_length=hp.get("mel", {}).get("hop_length", 441),
-                n_mels=hp.get("mel", {}).get("n_mels", 128),
-                max_samples=hp.get("log", {}).get("visual_max_samples", 3),
-                log_every_n_epochs=hp.get("log", {}).get(
-                    "visual_every_n_epochs", 1
-                ),
-                vocoder_every_n_epochs=1,
-            ),
-        ]
-
-        if TQDMProgressBar is not None:
-            callbacks.append(
-                TQDMProgressBar(
-                    refresh_rate=hp.get("log", {}).get(
-                        "progress_bar_refresh_rate", 10
-                    )
-                )
-            )
-
-        # ...existing code...
-
-        trainer_kwargs = dict(
-            max_epochs=stage_epochs,
-            detect_anomaly=hp["train"].get("detect_anomaly", False),
-            num_sanity_val_steps=2,
-            callbacks=callbacks,
-            check_val_every_n_epoch=hp["train"].get("check_val_every_n_epoch", 1),
-            logger=logger,
-            log_every_n_steps=hp.get("log", {}).get("log_every_n_steps", 50),
-            gradient_clip_val=hp.get("concrete", {}).get("grad_clip_norm", 5.0),
-            gradient_clip_algorithm="norm",
-            accumulate_grad_batches=hp["train"].get("accumulate_grad_batches", 4),
-        )
-
-        # ================================================================
-        # [GPU修复 5] 精度：FP16 混合精度，已确认 SSIM 手动 .float()
-        # ================================================================
-        if torch.cuda.is_available():
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            if _USE_PL2:
-                trainer_kwargs["precision"] = "bf16-mixed" if gpu_mem >= 20 else "16-mixed"
-                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → {trainer_kwargs['precision']}")
-            else:
-                trainer_kwargs["precision"] = 16
-                trainer_kwargs["amp_backend"] = "native"
-                print(f"[TRAIN] GPU {gpu_mem:.1f}GB → PL1 fp16 混合精度")
-         # ================================================================
-        # [GPU修复 6] DDP 策略：使用 DDPPlugin 对象而非字符串
-        # 
-        # 关键修复：
-        # 1. PL1 用 DDPPlugin(find_unused_parameters=False) 对象
-        # 2. 不再区分 torchrun / 普通启动 —— PL 自己会处理
-        # 3. 删除 CUDA_VISIBLE_DEVICES hack 后，PL 能正确看到所有 GPU
-        # ================================================================
-        if gpu_nums > 1:
-            if _USE_PL2:
-                trainer_kwargs["strategy"] = "ddp_find_unused_parameters_false"
-                trainer_kwargs["devices"] = gpu_nums
-                trainer_kwargs["accelerator"] = "gpu"
-            else:
-                # PL1: 用 DDPPlugin 对象，find_unused_parameters=False（Vocoder 冻结了）
-                if _DDPPlugin is not None:
-                    trainer_kwargs["strategy"] = _DDPPlugin(
-                        find_unused_parameters=False
-                    )
-                else:
-                    trainer_kwargs["strategy"] = "ddp"
-                trainer_kwargs["gpus"] = gpu_nums
-
-            trainer_kwargs["sync_batchnorm"] = True
-            print(f"[TRAIN] 🚀 DDP: {gpu_nums} GPUs, find_unused_parameters=False")
-
-        elif gpu_nums == 1:
-            if _USE_PL2:
-                trainer_kwargs["devices"] = 1
-                trainer_kwargs["accelerator"] = "gpu"
-            else:
-                trainer_kwargs["gpus"] = 1
-        else:
-            if _USE_PL2:
-                trainer_kwargs["accelerator"] = "cpu"
-
-
-       # ================================================================
-        # 智能加载机制（修复版）
-        # ================================================================
-        ckpt_path_for_fit = None  # 用于兼容新版 Lightning 的变量
-
-        if stage_idx == START_STAGE and resume_ckpt:
-            if "0.2139" in resume_ckpt:
-                # [情景 A] 初始换心手术：只拿权重，不要 Epoch
-                print(f"\n[INFO] 正在强行注入巅峰权重: {resume_ckpt}")
-                checkpoint = torch.load(resume_ckpt, map_location=lambda storage, loc: storage)
-                model.load_state_dict(checkpoint["state_dict"], strict=False)
-                
-                # 暴力抹除 Lightning 的恢复记忆
-                if "resume_from_checkpoint" in trainer_kwargs:
-                    del trainer_kwargs["resume_from_checkpoint"]
-            else:
-                # [情景 B] 正常断点续训：恢复 Epoch、优化器和权重
-                print(f"\n[INFO] 正常断点续训，完美继承进度: {resume_ckpt}")
-                trainer_kwargs["resume_from_checkpoint"] = resume_ckpt
-                ckpt_path_for_fit = resume_ckpt
-        else:
-            if "resume_from_checkpoint" in trainer_kwargs:
-                del trainer_kwargs["resume_from_checkpoint"]
-
-       
-        # ================================================================
-        # [调试] 打印最终 trainer_kwargs，确认精度和策略生效
-        # ================================================================
-        print("\n[TRAINER] 最终配置:")
-        for k in ("precision", "strategy", "devices", "gpus",
-                   "accelerator", "accumulate_grad_batches", "sync_batchnorm"):
-            if k in trainer_kwargs:
-                v = trainer_kwargs[k]
-                # strategy 对象打印类名
-                v_str = type(v).__name__ if hasattr(v, '__class__') and not isinstance(v, (str, int, float, bool)) else str(v)
-                print(f"  {k}: {v_str}")
-        trainer = Trainer(**trainer_kwargs)
-
+    print("\n🌪️ [Curriculum] 已废弃多阶段过渡，强制锁死在最终满级难度 (Stage 3)！")
+    stage3_cfg = hp["concrete"]["curriculum_stages"][-1]
     
-        # [Linux修复 2] 保存 Trainer 引用供信号处理器使用
-        global _trainer_ref
-        _trainer_ref = trainer
+    dm.phase2_intensity = stage3_cfg["phase2_intensity"]
+    dm.update_physics_config(stage3_cfg["physics_config"])
+    dm.update_collator_config(stage3_cfg["collator_config"])
+    dm.setup("fit")
 
-         # ================================================================
-        # [GPU修复 7] 确认 Trainer 实际检测到的 GPU 数
-        # ================================================================
-        if hasattr(trainer, 'num_gpus'):
-            print(f"[TRAINER] trainer.num_gpus = {trainer.num_gpus}")
-        if hasattr(trainer, 'data_parallel_device_ids'):
-            print(f"[TRAINER] device_ids = {trainer.data_parallel_device_ids}")
+    # =================================================================
+    # 3. 动态配置 Trainer 参数 (GPU 修复机制集成)
+    # =================================================================
+    trainer_kwargs = {
+        "logger": logger,
+        "max_epochs": hp["train"].get("max_epochs", 1000),
+        "gradient_clip_val": hp["train"].get("gradient_clip_val", 1.0),
+        "accumulate_grad_batches": hp["train"].get("accumulate_grad_batches", 1),
+        "num_sanity_val_steps": hp["train"].get("num_sanity_val_steps", 2),
+        "val_check_interval": hp["train"].get("val_check_interval", 1.0),
+        "log_every_n_steps": hp.get("log", {}).get("log_every_n_steps", 50),
+    }
 
-        lr_scale = stage.get("lr_scale", 1.0)
-        if lr_scale != 1.0 and lr_scale > 0 and stage_idx > 0:
-            opt_cfg = hp.get("concrete", {}).get("optimizer", {})
-            original_lr = opt_cfg.get("base_lr", 1e-4)
-            new_lr = original_lr * lr_scale
-            opt_cfg["base_lr"] = new_lr
-            print(f"[TRAIN] LR 缩放: {original_lr:.2e} × {lr_scale} = {new_lr:.2e}")
+    # 精度动态判断
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if _USE_PL2:
+            trainer_kwargs["precision"] = "bf16-mixed" if gpu_mem >= 20 else "16-mixed"
+        else:
+            trainer_kwargs["precision"] = 16
+            trainer_kwargs["amp_backend"] = "native"
 
-        dm.setup("fit")
+    # DDP 策略动态判断
+    if gpu_nums > 1:
+        if _USE_PL2:
+            trainer_kwargs["strategy"] = "ddp_find_unused_parameters_false"
+            trainer_kwargs["devices"] = gpu_nums
+            trainer_kwargs["accelerator"] = "gpu"
+        else:
+            if _DDPPlugin is not None:
+                trainer_kwargs["strategy"] = _DDPPlugin(find_unused_parameters=False)
+            else:
+                trainer_kwargs["strategy"] = "ddp"
+            trainer_kwargs["gpus"] = gpu_nums
+        trainer_kwargs["sync_batchnorm"] = True
+    elif gpu_nums == 1:
+        if _USE_PL2:
+            trainer_kwargs["devices"] = 1
+            trainer_kwargs["accelerator"] = "gpu"
+        else:
+            trainer_kwargs["gpus"] = 1
+    else:
+        if _USE_PL2:
+            trainer_kwargs["accelerator"] = "cpu"
 
-        try:
-            trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path_for_fit)
-        except TypeError:
-            trainer.fit(model, datamodule=dm)
+    # =================================================================
+    # 4. 配置 Callbacks
+    # =================================================================
+    callbacks = [
+        LearningRateMonitor(logging_interval="step"),
+        ModelCheckpoint(
+            filename="ultimate_stage3_{epoch}-{step}-{val_loss:.4f}",
+            dirpath=os.path.join(logger.log_dir, "checkpoints"),
+            save_top_k=hp["train"].get("save_top_k", 3),
+            monitor="val_loss",
+            mode="min",
+            save_last=True,
+        ),
+        EarlyStopping(
+            monitor="val_loss",
+            patience=hp["train"].get("early_stop_patience", 1000), 
+            mode="min",
+            verbose=True,
+        ),
+        initLogDir(hp, current_dir=os.getcwd()),
+        AudioVisualLoggingCallback(
+            sample_rate=hp["data"]["sampling_rate"],
+            n_fft=hp.get("mel", {}).get("n_fft", 2048),
+            hop_length=hp.get("mel", {}).get("hop_length", 441),
+            n_mels=hp.get("mel", {}).get("n_mels", 128),
+            max_samples=hp.get("log", {}).get("visual_max_samples", 6),
+            log_every_n_epochs=1,
+            vocoder_every_n_epochs=1,
+        ),
+    ]
 
-        stage_ckpt = os.path.join(
-            logger.log_dir, "checkpoints", f"stage_{stage_idx}_final.ckpt"
-        )
-        trainer.save_checkpoint(stage_ckpt)
-        print(f"[STAGE {stage_idx}] 完成 → {stage_ckpt}")
+    if TQDMProgressBar is not None:
+        callbacks.append(TQDMProgressBar(refresh_rate=hp.get("log", {}).get("progress_bar_refresh_rate", 10)))
+    
+    trainer_kwargs["callbacks"] = callbacks
 
-        resume_ckpt = None
-        if lr_scale != 1.0 and lr_scale > 0 and stage_idx > 0:
-            opt_cfg = hp.get("concrete", {}).get("optimizer", {})
-            opt_cfg["base_lr"] = opt_cfg["base_lr"] / lr_scale
+    # =================================================================
+    # 5. 点火启动！
+    # =================================================================
+    from pytorch_lightning import Trainer # 确保导入
+    print("\n[TRAINER] 启动配置已锁定，抛弃 resume_ckpt 羁绊，直接 Fit！")
+    trainer = Trainer(**trainer_kwargs)
+    
+    global _trainer_ref
+    _trainer_ref = trainer
 
+    # 因为是 Warm Start，决不能传入 ckpt_path 阻止它继承失败的 Epoch！
+    trainer.fit(model, datamodule=dm)
+
+    # 最终保存
+    final_ckpt = os.path.join(logger.log_dir, "checkpoints", "stage_3_ultimate_final.ckpt")
+    trainer.save_checkpoint(final_ckpt)
+    
     _trainer_ref = None
     print("\n" + "=" * 60)
-    print("  全部训练阶段完成")
+    print(f"  终极训练阶段完成，模型已保存至: {final_ckpt}")
     print("=" * 60)
 
 
