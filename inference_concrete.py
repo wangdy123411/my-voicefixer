@@ -202,14 +202,14 @@ if __name__ == "__main__":
     INPUT_DIR = "/root/autodl-tmp/Ground" 
     
     # 2. 结果输出文件夹
-    OUT_DIR = "/root/autodl-tmp/results_batch/Epoch149_v25"
+    OUT_DIR = "/root/autodl-tmp/results_batch/Epoch39_v26"
     
     # 3. 为当前使用的权重起个名字（会显示在图表和文件名中）
-    WEIGHT_LABEL = "Epoch149_V25" 
+    WEIGHT_LABEL = "Epoch39_V26" 
     
     # 4. 模型配置与权重路径
     CONFIG_FILE = "config/train_concrete.json"
-    CKPT_FILE = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_25/checkpoints/ultimate_stage3_epoch=149-step=42599.ckpt" # 替换为你最新的权重
+    CKPT_FILE = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_26/checkpoints/ultimate_stage3_epoch=39-step=11359.ckpt" # 替换为你最新的权重
     # ==============================================
     
     batch_process_folder(INPUT_DIR, OUT_DIR, CONFIG_FILE, CKPT_FILE, WEIGHT_LABEL)

@@ -110,10 +110,10 @@ if __name__ == "__main__":
     INPUT_DIR = "/root/autodl-tmp/Ground" 
     
     # 2. 上一个脚本输出修复后音频的文件夹
-    RESULTS_DIR = "/root/autodl-tmp/results_batch/Epoch149_v25"
+    RESULTS_DIR = "/root/autodl-tmp/results_batch/VoiceFixer_Only_Epoch29_v24"
     
     # 3. 你上一轮跑批量脚本时设置的 WEIGHT_LABEL，必须保持一致才能找到对应的文件！
-    WEIGHT_LABEL = "Epoch149_V25" 
+    WEIGHT_LABEL = "Epoch29_V24" 
     # ============================================
     
     batch_evaluate_dnsmos(INPUT_DIR, RESULTS_DIR, WEIGHT_LABEL)

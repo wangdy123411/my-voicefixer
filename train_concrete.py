@@ -192,8 +192,8 @@ class AudioVisualLoggingCallback(Callback):
         hop_length: int = 441,
         n_mels: int = 128,
         max_samples: int = 6,            # ← [解封] 从 2 提升到 6，观测更多数据
-        log_every_n_epochs: int = 3,     # ← 每一个 Epoch 都记录
-        vocoder_every_n_epochs: int = 3 , # ← [解封] 每一个 Epoch 都强制跑 Vocoder 生成音频
+        log_every_n_epochs: int =  2,     # ← 每一个 Epoch 都记录
+        vocoder_every_n_epochs: int = 2 , # ← [解封] 每一个 Epoch 都强制跑 Vocoder 生成音频
     ):
         super().__init__()
         self.sr = sample_rate
@@ -354,8 +354,8 @@ class AudioVisualLoggingCallback(Callback):
                             f"{tag_prefix}/3_AI_Restored",
                             p.unsqueeze(0), step, sample_rate=self.sr
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"\n[VisualBug] 音频保存失败: {e}")
 
             try:
                 # 3. 画出三行频谱对比图
@@ -366,11 +366,14 @@ class AudioVisualLoggingCallback(Callback):
 
                 fig = self._plot_mel_comparison_v2(c, d, p_audio, step, i)
                 if fig is not None:
-                    logger_exp.add_figure(f"{tag_prefix}/mel_pipeline", fig, step)
+                    logger_exp.add_figure(f"{tag_prefix}/mel_pipeline", fig, global_step=step)
+                    fig.canvas.draw()
                     fig.clear()
                     plt.close(fig)
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                print(f"\n[VisualBug] 频谱图绘制/写入崩溃: {e}")
+                traceback.print_exc()
 
         # 兜底清理内存
         plt.close('all')
@@ -378,6 +381,7 @@ class AudioVisualLoggingCallback(Callback):
 
         import gc
         gc.collect()
+
 
     def _plot_mel_comparison_v2(self, clean, dirty, pred, epoch, sample_idx):
         """
@@ -388,6 +392,7 @@ class AudioVisualLoggingCallback(Callback):
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
         except ImportError:
+            print("[VisualBug] matplotlib 导入失败，无法画图")
             return None
 
         has_pred = pred is not None
@@ -984,19 +989,13 @@ class ConcreteVoiceFixer(VoiceFixer):
     def training_step(self, batch, batch_idx):
         dirty_audio = batch["input_wave"]
         clean_audio = batch["target_wave"]
-        cutoff_hz = batch["cutoff_hz"]
 
         device = self.device
         
         dirty_audio = dirty_audio.to(device, dtype=torch.float32)
         clean_audio = clean_audio.to(device, dtype=torch.float32)
-        cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
 
-        # 1. 频域低通滤波 (依然在 GPU，速度极快)
-        with torch.cuda.amp.autocast(enabled=False):
-            dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-                waveform=dirty_audio, cutoff_hz=cutoff_hz, sample_rate=self.hp["data"]["sampling_rate"],
-            )
+        # ❌ 已彻底删除 GPU FFT 二次低通滤波，直接使用带有真实 IR 的波形！
 
         # 🛡️ 基础防爆清洗
         dirty_audio = torch.nan_to_num(dirty_audio, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
@@ -1007,7 +1006,7 @@ class ConcreteVoiceFixer(VoiceFixer):
         if dirty_audio.dim() == 2: dirty_audio = dirty_audio.unsqueeze(1)
         if clean_audio.dim() == 2: clean_audio = clean_audio.unsqueeze(1)
 
-        # 获取 Mel 频谱 (这里是核心，速度起飞的地方)
+        # 获取 Mel 频谱
         _, mel_target = self.pre(clean_audio)
         _, mel_low_quality = self.pre(dirty_audio)
 
@@ -1015,29 +1014,27 @@ class ConcreteVoiceFixer(VoiceFixer):
         mel_target_safe = torch.nan_to_num(mel_target, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
 
         # U-Net 前向传播
-        generated = self(mel_low_quality)
-        gen_mel = generated['mel']
+        generated = self(mel_low_quality)['mel']
         target_log_mel = to_log(mel_target_safe)
 
-        min_frames = min(gen_mel.size(2), target_log_mel.size(2))
-        gen_mel = gen_mel[:, :, :min_frames, :]
+        min_frames = min(generated.size(2), target_log_mel.size(2))
+        gen_mel = generated[:, :, :min_frames, :]
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
         # =========================================================
         # 🚀 极致轻量版：平滑加权 L1 + MSE (锐化混合损失)
-        # 绝不碰 Vocoder，计算速度拉满！
         # =========================================================
         n_mels = target_log_mel.size(2)
         linspace_weight = torch.linspace(2.0, 0.8, steps=n_mels, device=device)
         weight_mask = linspace_weight.view(1, 1, n_mels, 1).expand_as(target_log_mel)
 
-        # 1. L1 Loss (保底，维持人声基本轮廓)
+        # 1. L1 Loss (保底轮廓)
         loss_l1 = torch.mean(torch.abs(gen_mel - target_log_mel) * weight_mask)
         
-        # 2. L2 / MSE Loss (逼迫网络生成极其锐利的高频线条，解决发闷)
+        # 2. MSE Loss (逼迫高频锐化)
         loss_mse = torch.mean(torch.square(gen_mel - target_log_mel) * weight_mask)
 
-        # 融合：以 L1 为主，辅以少量 MSE 增加锐度
+        # 融合 Loss
         loss = loss_l1 + 0.15 * loss_mse
 
         # DDP 安全防爆
@@ -1048,22 +1045,17 @@ class ConcreteVoiceFixer(VoiceFixer):
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return {"loss": loss}
 
+
     def validation_step(self, batch, batch_idx):
         dirty_audio = batch["input_wave"]
         clean_audio = batch["target_wave"]
-        cutoff_hz = batch["cutoff_hz"]
 
         device = self.device
 
         dirty_audio = dirty_audio.to(device, dtype=torch.float32)
         clean_audio = clean_audio.to(device, dtype=torch.float32)
-        cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
 
-        # 1. 频域低通滤波 (依然在 GPU，速度极快)
-        with torch.cuda.amp.autocast(enabled=False):
-            dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-                waveform=dirty_audio, cutoff_hz=cutoff_hz, sample_rate=self.hp["data"]["sampling_rate"],
-            )
+        # ❌ 已彻底删除 GPU FFT 二次低通滤波
 
         # 🛡️ 基础防爆清洗
         dirty_audio = torch.nan_to_num(dirty_audio, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
@@ -1075,14 +1067,12 @@ class ConcreteVoiceFixer(VoiceFixer):
         if clean_audio.dim() == 2: clean_audio = clean_audio.unsqueeze(1)
 
         with torch.no_grad():
-            # 获取 Mel 频谱
             _, mel_target = self.pre(clean_audio)
             _, mel_low_quality = self.pre(dirty_audio)
 
             mel_low_quality = torch.nan_to_num(mel_low_quality, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
             mel_target_safe = torch.nan_to_num(mel_target, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
 
-            # U-Net 前向传播
             estimation = self(mel_low_quality)['mel']
             target_log_mel = to_log(mel_target_safe)
 
@@ -1091,39 +1081,30 @@ class ConcreteVoiceFixer(VoiceFixer):
             target_log_mel = target_log_mel[:, :, :min_frames, :]
 
             # =========================================================
-            # 🚀 极致轻量版：平滑加权 L1 + MSE (彻底拔除 Vocoder 和 STFT)
+            # 🚀 平滑加权 L1 + MSE 计算
             # =========================================================
             n_mels = target_log_mel.size(2)
             linspace_weight = torch.linspace(2.0, 0.8, steps=n_mels, device=device)
             weight_mask = linspace_weight.view(1, 1, n_mels, 1).expand_as(target_log_mel)
 
-            # 1. L1 Loss
             loss_mel = torch.mean(torch.abs(estimation - target_log_mel) * weight_mask)
-            
-            # 2. MSE Loss
             loss_mse = torch.mean(torch.square(estimation - target_log_mel) * weight_mask)
-
-            # 融合 Loss
             val_loss = loss_mel + 0.15 * loss_mse
 
-            # 防爆托底
             if not torch.isfinite(val_loss):
                 val_loss = torch.tensor(0.0, device=device)
 
-            # =========================================================
-            # 🛡️ 无条件计算并记录 LSD，防止 DDP 挂起死锁
-            # =========================================================
+            # 🛡️ 无条件记录 LSD，防止 DDP 挂起死锁
             lsd_val = torch.mean(torch.sqrt(torch.mean((estimation - target_log_mel) ** 2, dim=2)))
             lsd_val = torch.nan_to_num(lsd_val, nan=0.0, posinf=100.0, neginf=0.0)
             self.log("val_lsd", lsd_val, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-        # 记录轻量化之后的各项 Loss
         self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_loss_mel", loss_mel, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("val_loss_mse", loss_mse, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # =========================================================
-        # 🎨 [画图直传黑科技] 把数据悄悄存在 self 里，绕开 Lightning 死亡合并
+        # 🎨 画图数据直传黑科技
         # =========================================================
         if batch_idx == 0:
             self._viz_cache = {
@@ -1132,7 +1113,6 @@ class ConcreteVoiceFixer(VoiceFixer):
                 "viz_pred_mel": estimation[:6].detach().cpu()
             }
             
-        # 永远只返回标量字典
         return {"val_loss": val_loss}
 
     def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
