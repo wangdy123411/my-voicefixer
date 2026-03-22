@@ -31,7 +31,6 @@ warnings.filterwarnings('ignore', message='.*is_neg_inf.*')
 warnings.filterwarnings('ignore', message='.*isfinite.*')
 warnings.filterwarnings('ignore', message='.*has_inf_or_nan.*')
 warnings.filterwarnings('ignore', message='.*SoX.*')
-# [代码修复 1] 不再全局替换 warnings.warn，保留 PyTorch 真实错误警告
 
 import sys
 import json
@@ -59,6 +58,69 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from dataloaders.collators.concrete_collator import ConcreteEavesdropCollatorGPU
 from pytorch_lightning.plugins import DDPPlugin
+
+# [代码修复 1] 不再全局替换 warnings.warn，保留 PyTorch 真实错误警告
+import torch.nn.functional as F
+
+# =====================================================================
+# 🚀 进阶武器库：多尺度频域损失 (Multi-Resolution STFT Loss)
+# =====================================================================
+def stft(x, fft_size, hop_size, win_length, window):
+    """执行 STFT 并返回幅度谱 (Magnitude Spectrogram)"""
+    # 兼容 PyTorch 新版复数输出
+    x_stft = torch.stft(x, fft_size, hop_size, win_length, window, return_complex=True, pad_mode='reflect')
+    mag = torch.abs(x_stft)
+    return torch.clamp(mag, min=1e-7)
+
+class SpectralConvergenceLoss(torch.nn.Module):
+    """频谱收敛损失 (Spectral Convergence Loss) - 逼迫整体频谱结构对齐"""
+    def forward(self, x_mag, y_mag):
+        return torch.norm(y_mag - x_mag, p="fro") / torch.norm(y_mag, p="fro").clamp(min=1e-7)
+
+class LogSTFTMagnitudeLoss(torch.nn.Module):
+    """对数 STFT 幅度损失 (Log STFT Magnitude Loss) - 逼迫高频细节对齐"""
+    def forward(self, x_mag, y_mag):
+        return F.l1_loss(torch.log(x_mag), torch.log(y_mag))
+
+class STFTLoss(torch.nn.Module):
+    def __init__(self, fft_size=1024, shift_size=120, win_length=600, device="cpu"):
+        super().__init__()
+        self.fft_size = fft_size
+        self.shift_size = shift_size
+        self.win_length = win_length
+        # 使用 register_buffer 确保 window 能自动跟随模型到 GPU
+        self.register_buffer("window", torch.hann_window(win_length))
+        self.sc_loss = SpectralConvergenceLoss()
+        self.mag_loss = LogSTFTMagnitudeLoss()
+
+    def forward(self, x, y):
+        x_mag = stft(x, self.fft_size, self.shift_size, self.win_length, self.window)
+        y_mag = stft(y, self.fft_size, self.shift_size, self.win_length, self.window)
+        sc_loss = self.sc_loss(x_mag, y_mag)
+        mag_loss = self.mag_loss(x_mag, y_mag)
+        return sc_loss, mag_loss
+
+class MultiResolutionSTFTLoss(torch.nn.Module):
+    def __init__(self,
+                 # 针对 44.1kHz 的超高分辨率配置，覆盖低频轰鸣到高频气声
+                 fft_sizes=[2048, 1024, 512, 256],
+                 hop_sizes=[512, 256, 128, 64],
+                 win_lengths=[2048, 1024, 512, 256]):
+        super().__init__()
+        self.stft_losses = torch.nn.ModuleList()
+        for fs, ss, wl in zip(fft_sizes, hop_sizes, win_lengths):
+            self.stft_losses.append(STFTLoss(fs, ss, wl))
+
+    def forward(self, x, y):
+        sc_loss = 0.0
+        mag_loss = 0.0
+        for f in self.stft_losses:
+            sc_l, mag_l = f(x, y)
+            sc_loss += sc_l
+            mag_loss += mag_l
+        sc_loss /= len(self.stft_losses)
+        mag_loss /= len(self.stft_losses)
+        return sc_loss , mag_loss
 # ============================================================================
 #  PL 版本兼容层
 # ============================================================================
@@ -225,99 +287,71 @@ class AudioVisualLoggingCallback(Callback):
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
     ):
+        # 只有到了设定的 Epoch 并且是第 0 个 Batch 才会触发，避免冗余执行
         if trainer.current_epoch % self.log_every_n_epochs != 0:
             return
-        
-        if self._cache_captured or batch_idx > 0:
+        if batch_idx > 0 or self._cache_captured:
             return
 
         try:
-            if not isinstance(batch, dict):
+            # 🚀 直接从 validation_step 的 outputs 里白嫖算好的数据！不再重复推理！
+            dirty = outputs.get("viz_dirty")
+            clean = outputs.get("viz_clean")
+            pred_log_mel = outputs.get("viz_pred_mel")
+
+            if dirty is None or clean is None or pred_log_mel is None:
                 return
-
-            dirty = batch.get("input_wave")
-            clean = batch.get("target_wave")
-            cutoff_hz = batch.get("cutoff_hz")  # 👈 [修复1] 把截断频率拿出来！
-
-            if dirty is None or clean is None:
-                return
-
-            if dirty.dim() == 2:
-                dirty = dirty.unsqueeze(1)
-            if clean.dim() == 2:
-                clean = clean.unsqueeze(1)
-
-            device = pl_module.device
-            dirty = dirty.to(device, dtype=torch.float32)
-            clean = clean.to(device, dtype=torch.float32)
-
-            # 🚀 [修复2] 删除了之前的 1e-7 白噪声，保持频谱的绝对干净！
 
             run_vocoder = (trainer.current_epoch % self.vocoder_every_n_epochs == 0)
+            prediction = None
 
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+            if run_vocoder:
+                device = pl_module.device
+                # 把截取好的样本重新放回 GPU 给声码器
+                pred_log_mel = pred_log_mel.to(device)
+                pred_log_mel_safe = pred_log_mel.clamp(-11.5, 3.0)
+                pred_linear_mel = 10 ** pred_log_mel_safe
+
+                vocoder_module, _ = pl_module._find_vocoder_module()
                 
+                predictions = []
                 # =========================================================
-                # 💥 [修复3] 强制画图插件也执行 GPU 低通滤波！
-                # 这样 TensorBoard 里的图就会呈现出完美的“一刀切”截断线！
+                # 🛡️ [防 OOM 核心] 声码器串行生成！
+                # 绝不一次性塞入 6 根 3 秒的音频，而是 1 根 1 根地跑，保底不炸显存
                 # =========================================================
-                if cutoff_hz is not None:
-                    from dataloaders.collators.concrete_collator import ConcreteEavesdropCollatorGPU
-                    cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
-                    dirty = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-                        waveform=dirty,
-                        cutoff_hz=cutoff_hz,
-                        sample_rate=self.sr
-                    )
-
-                _, mel_low_quality = pl_module.pre(dirty)
-                
-                # 用极其安全的 1e-10 托底，防 to_log 报错
-                mel_low_quality = torch.nan_to_num(mel_low_quality, nan=1e-10, posinf=2.0, neginf=1e-10)
-                mel_low_quality = mel_low_quality.clamp(min=1e-10)
-                
-                pred_mel_dict = pl_module(mel_low_quality)
-                pred_log_mel = pred_mel_dict['mel']
-
-                pred_log_mel = torch.nan_to_num(pred_log_mel, nan=-11.5, posinf=3.0, neginf=-11.5)
-
-                prediction = None
-                if run_vocoder:
-                    try:
-                        pred_log_mel_safe = pred_log_mel.clamp(-11.5, 3.0)
-                        pred_linear_mel = 10 ** pred_log_mel_safe
-
-                        n_voc = min(self.max_samples, pred_linear_mel.shape[0])
-                        pred_linear_mel_subset = pred_linear_mel[:n_voc]
-
-                        vocoder_module, _ = pl_module._find_vocoder_module()
+                with torch.no_grad():
+                    for i in range(pred_linear_mel.shape[0]):
+                        mel_i = pred_linear_mel[i:i+1] # 提取单条
                         if vocoder_module is not None:
-                            prediction = pl_module.vocoder(pred_linear_mel_subset)
+                            pred_i = vocoder_module(mel_i)
                         else:
-                            prediction = pl_module.vocoder(pred_linear_mel_subset)
-                    except Exception as e:
-                        print(f"[AudioVisual] Vocoder 推理失败: {e}")
-                        prediction = None
+                            pred_i = pl_module.vocoder(mel_i)
+                        # 算完立刻拉回 CPU 释放显存
+                        predictions.append(pred_i.cpu()) 
+                
+                prediction = torch.cat(predictions, dim=0)
 
-                min_len = dirty.shape[-1]
-                dirty = dirty[..., :min_len]
-                clean = clean[..., :min_len]
-                if prediction is not None:
-                    pred_min = min(min_len, prediction.shape[-1])
-                    dirty = dirty[..., :pred_min]
-                    clean = clean[..., :pred_min]
-                    prediction = prediction[..., :pred_min]
+            # 长度对齐裁剪
+            min_len = dirty.shape[-1]
+            dirty = dirty[..., :min_len]
+            clean = clean[..., :min_len]
+            if prediction is not None:
+                pred_min = min(min_len, prediction.shape[-1])
+                dirty = dirty[..., :pred_min]
+                clean = clean[..., :pred_min]
+                prediction = prediction[..., :pred_min]
 
+            # 存入缓存，等 epoch_end 时去真正画图
             self._val_cache = {
-                "dirty": dirty.detach().cpu(),
-                "clean": clean.detach().cpu(),
-                "prediction": prediction.detach().cpu() if prediction is not None else None,
-                "pred_mel": pred_log_mel.detach().cpu(),
+                "dirty": dirty,
+                "clean": clean,
+                "prediction": prediction,
+                "pred_mel": pred_log_mel.cpu(),
             }
             self._cache_captured = True
 
         except Exception as e:
-            print(f"\n[AudioVisual] 验证集数据捕获失败: {e}\n")
+            print(f"\n[AudioVisual] 验证集出图数据捕获失败: {e}\n")
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if self._val_cache is None:
@@ -995,7 +1029,7 @@ class ConcreteVoiceFixer(VoiceFixer):
         sched_cfg = self.concrete_cfg.get("scheduler", {})
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            T_0=sched_cfg.get("T_0", 10),
+            T_0=sched_cfg.get("T_0", 100),
             T_mult=sched_cfg.get("T_mult", 2),
             eta_min=sched_cfg.get("eta_min", 1e-7),
         )
@@ -1018,43 +1052,109 @@ class ConcreteVoiceFixer(VoiceFixer):
         clean_audio = batch["target_wave"]
         cutoff_hz = batch["cutoff_hz"]
 
-        # [Linux修复 4] 显式确保张量在正确设备上（DDP 下必须）
         device = self.device
-        dirty_audio = dirty_audio.to(device)
-        clean_audio = clean_audio.to(device)
-        cutoff_hz = cutoff_hz.to(device)
+        
+        # [懒加载] 实例化 MR-STFT Loss
+        if not hasattr(self, "mr_stft_loss"):
+            self.mr_stft_loss = MultiResolutionSTFTLoss().to(device)
+        
+        dirty_audio = dirty_audio.to(device, dtype=torch.float32)
+        clean_audio = clean_audio.to(device, dtype=torch.float32)
+        cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
 
-        # GPU 频域低通滤波
-        dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-            waveform=dirty_audio,
-            cutoff_hz=cutoff_hz,
-            sample_rate=self.hp["data"]["sampling_rate"],
-        )
+        # 1. 频域低通滤波
+        with torch.cuda.amp.autocast(enabled=False):
+            dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
+                waveform=dirty_audio, cutoff_hz=cutoff_hz, sample_rate=self.hp["data"]["sampling_rate"],
+            )
 
-        if dirty_audio.dim() == 2:
-            dirty_audio = dirty_audio.unsqueeze(1)
-        if clean_audio.dim() == 2:
-            clean_audio = clean_audio.unsqueeze(1)
+        # 🛡️ 基础防爆清洗
+        dirty_audio = torch.nan_to_num(dirty_audio, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        clean_audio = torch.nan_to_num(clean_audio, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        dirty_audio = dirty_audio + torch.randn_like(dirty_audio) * 1e-7
+        clean_audio = clean_audio + torch.randn_like(clean_audio) * 1e-7
+
+        if dirty_audio.dim() == 2: dirty_audio = dirty_audio.unsqueeze(1)
+        if clean_audio.dim() == 2: clean_audio = clean_audio.unsqueeze(1)
 
         _, mel_target = self.pre(clean_audio)
         _, mel_low_quality = self.pre(dirty_audio)
 
-        generated = self(mel_low_quality)
-        target_log_mel = to_log(mel_target)
-        gen_mel = generated['mel']
+        mel_low_quality = torch.nan_to_num(mel_low_quality, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
+        mel_target_safe = torch.nan_to_num(mel_target, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
 
-        # 强制对齐时间维度
+        # 神经网络前向传播
+        generated = self(mel_low_quality)
+        gen_mel = generated['mel']
+        target_log_mel = to_log(mel_target_safe)
+
         min_frames = min(gen_mel.size(2), target_log_mel.size(2))
         gen_mel = gen_mel[:, :, :min_frames, :]
         target_log_mel = target_log_mel[:, :, :min_frames, :]
 
-        # 回归最纯粹的频谱能量 L1 拟合
-        loss = self.l1loss(gen_mel, target_log_mel)
-        
-        # 记录日志
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        # =========================================================
+        # 🟢 Loss 1: 平滑渐变 Mel 频段加权 (死保低频人声底子)
+        # =========================================================
+        n_mels = target_log_mel.size(2)
+        linspace_weight = torch.linspace(2.0, 0.8, steps=n_mels, device=device)
+        weight_mask = linspace_weight.view(1, 1, n_mels, 1).expand_as(target_log_mel)
+        loss_mel = torch.mean(torch.abs(gen_mel - target_log_mel) * weight_mask)
 
-        return {"loss": loss}
+        # =========================================================
+        # 🚀 Loss 2: 声码器感知 MR-STFT Loss (突破发闷天花板)
+        # =========================================================
+        # 💡 [重大升级] Batch=24 时显存释放，切片从 64 帧直接拉大到 128 帧 (~1.3秒)！
+        # 3 秒的音频大约有 300 帧，每次随机截取 128 帧计算极高精度的高频波形误差。
+        crop_frames = 128 
+        hop_length = self.hp.get("mel", {}).get("hop_length", 441)
+        
+        if min_frames > crop_frames:
+            start_frame = torch.randint(0, min_frames - crop_frames, (1,)).item()
+            gen_mel_crop = gen_mel[:, :, start_frame : start_frame + crop_frames, :]
+            
+            # 精确换算到波形级别的采样点
+            start_sample = start_frame * hop_length
+            end_sample = (start_frame + crop_frames) * hop_length
+            clean_audio_crop = clean_audio[:, :, start_sample : end_sample]
+        else:
+            gen_mel_crop = gen_mel
+            clean_audio_crop = clean_audio
+
+        # 1. 解码为线性 Mel (必须保留梯度，穿透 Vocoder 传回 U-Net！)
+        gen_mel_linear = 10 ** gen_mel_crop.clamp(-11.5, 3.0)
+
+        # 2. 穿过声码器，将 Mel 频谱变成真正的音频波形
+        voc_module, _ = self._find_vocoder_module()
+        gen_audio = voc_module(gen_mel_linear) if voc_module else self.vocoder(gen_mel_linear)
+        
+        # 裁剪可能多出的微小采样点对齐误差
+        min_audio_len = min(gen_audio.size(-1), clean_audio_crop.size(-1))
+        gen_audio = gen_audio[..., :min_audio_len].squeeze(1)          # Shape: (B, T)
+        clean_audio_crop = clean_audio_crop[..., :min_audio_len].squeeze(1) # Shape: (B, T)
+
+        gen_audio = gen_audio.to(device)
+        clean_audio_crop = clean_audio_crop.to(device)
+
+        # 3. 计算多分辨率波形 STFT Loss
+        loss_sc, loss_mag = self.mr_stft_loss(gen_audio, clean_audio_crop)
+        loss_stft = loss_sc + loss_mag
+
+        # =========================================================
+        # 🔗 终极 Loss 融合
+        # 给予 MR-STFT 0.5 的权重。此时 L1 负责大致轮廓，STFT 负责微雕高频清晰度
+        # =========================================================
+        total_loss = loss_mel + 0.5 * loss_stft
+
+        # DDP 安全防爆
+        if not torch.isfinite(total_loss):
+            print(f"\n⚠️ [TRAIN WARNING] 批次 {batch_idx} 产生 NaN Loss！(Mel: {loss_mel.item():.4f}, STFT: {loss_stft.item():.4f})")
+            total_loss = (gen_mel.sum() * 0.0)
+
+        self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("loss_mel", loss_mel, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("loss_stft", loss_stft, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        
+        return {"loss": total_loss}
 
     def validation_step(self, batch, batch_idx):
         dirty_audio = batch["input_wave"]
@@ -1063,57 +1163,103 @@ class ConcreteVoiceFixer(VoiceFixer):
 
         device = self.device
         
-        # 🛡️ FP32 防爆与清洗
+        # 懒加载 MR-STFT Loss
+        if not hasattr(self, "mr_stft_loss"):
+            
+            self.mr_stft_loss = MultiResolutionSTFTLoss().to(device)
+
         dirty_audio = dirty_audio.to(device, dtype=torch.float32)
         clean_audio = clean_audio.to(device, dtype=torch.float32)
         cutoff_hz = cutoff_hz.to(device, dtype=torch.float32)
 
-        dirty_audio = torch.nan_to_num(dirty_audio, nan=0.0)
-        clean_audio = torch.nan_to_num(clean_audio, nan=0.0)
-
-        # 🛡️ 局部的 GPU 低通滤波
         with torch.cuda.amp.autocast(enabled=False):
             dirty_audio = ConcreteEavesdropCollatorGPU.gpu_fft_lowpass(
-                waveform=dirty_audio,
-                cutoff_hz=cutoff_hz,
-                sample_rate=self.hp["data"]["sampling_rate"],
+                waveform=dirty_audio, cutoff_hz=cutoff_hz, sample_rate=self.hp["data"]["sampling_rate"],
             )
 
-        if dirty_audio.dim() == 2:
-            dirty_audio = dirty_audio.unsqueeze(1)
-        if clean_audio.dim() == 2:
-            clean_audio = clean_audio.unsqueeze(1)
+        # 🛡️ 基础防爆清洗
+        dirty_audio = torch.nan_to_num(dirty_audio, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        clean_audio = torch.nan_to_num(clean_audio, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        dirty_audio = dirty_audio + torch.randn_like(dirty_audio) * 1e-7
+        clean_audio = clean_audio + torch.randn_like(clean_audio) * 1e-7
 
-        # =========================================================
-        # 💥 [终极修复] 把过滤好的、安全的音频塞回 batch 字典！
-        # 这样后面的 AudioVisualLoggingCallback 画图时就不会拿到有毒数据了！
-        # =========================================================
-        batch["input_wave"] = dirty_audio
-        batch["target_wave"] = clean_audio
+        if dirty_audio.dim() == 2: dirty_audio = dirty_audio.unsqueeze(1)
+        if clean_audio.dim() == 2: clean_audio = clean_audio.unsqueeze(1)
 
         with torch.no_grad():
             _, mel_target = self.pre(clean_audio)
             _, mel_low_quality = self.pre(dirty_audio)
             
-            estimation = self(mel_low_quality)['mel']
+            mel_low_quality = torch.nan_to_num(mel_low_quality, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
+            mel_target_safe = torch.nan_to_num(mel_target, nan=1e-10, posinf=1e5, neginf=1e-10).clamp(min=1e-10)
             
-            # 钳制极小值防 -inf
-            mel_target_safe = mel_target.clamp(min=1e-5)
+            estimation = self(mel_low_quality)['mel']
             target_log_mel = to_log(mel_target_safe)
 
             min_frames = min(estimation.size(2), target_log_mel.size(2))
             estimation = estimation[:, :, :min_frames, :]
             target_log_mel = target_log_mel[:, :, :min_frames, :]
 
-            val_loss = self.l1loss(estimation, target_log_mel)
+            # 🟢 Loss 1: 平滑 Mel Loss
+            n_mels = target_log_mel.size(2)
+            linspace_weight = torch.linspace(2.0, 0.8, steps=n_mels, device=device)
+            weight_mask = linspace_weight.view(1, 1, n_mels, 1).expand_as(target_log_mel)
+            loss_mel = torch.mean(torch.abs(estimation - target_log_mel) * weight_mask)
 
-            # 防爆护盾
+            # 🚀 Loss 2: 验证集也要计算 MR-STFT Loss (切片评估)
+            crop_frames = 128
+            hop_length = self.hp.get("mel", {}).get("hop_length", 441)
+            
+            if min_frames > crop_frames:
+                start_frame = torch.randint(0, min_frames - crop_frames, (1,)).item()
+                gen_mel_crop = estimation[:, :, start_frame : start_frame + crop_frames, :]
+                start_sample = start_frame * hop_length
+                end_sample = (start_frame + crop_frames) * hop_length
+                clean_audio_crop = clean_audio[:, :, start_sample : end_sample]
+            else:
+                gen_mel_crop = estimation
+                clean_audio_crop = clean_audio
+
+            gen_mel_linear = 10 ** gen_mel_crop.clamp(-11.5, 3.0)
+            voc_module, _ = self._find_vocoder_module()
+            gen_audio = voc_module(gen_mel_linear) if voc_module else self.vocoder(gen_mel_linear)
+            
+            min_audio_len = min(gen_audio.size(-1), clean_audio_crop.size(-1))
+            gen_audio = gen_audio[..., :min_audio_len].squeeze(1)
+            clean_audio_crop = clean_audio_crop[..., :min_audio_len].squeeze(1)
+
+            gen_audio = gen_audio.to(device)
+            clean_audio_crop = clean_audio_crop.to(device)
+
+            loss_sc, loss_mag = self.mr_stft_loss(gen_audio, clean_audio_crop)
+            loss_stft = loss_sc + loss_mag
+
+            val_loss = loss_mel + 0.5 * loss_stft
+
             if not torch.isfinite(val_loss):
                 val_loss = torch.tensor(0.0, device=device)
 
-        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            try:
+                lsd_val = torch.mean(torch.sqrt(torch.mean((estimation - target_log_mel) ** 2, dim=2)))
+                if torch.isfinite(lsd_val):
+                    self.log("val_lsd", lsd_val, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            except Exception:
+                pass
 
-        return {"val_loss": val_loss}
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("val_loss_mel", loss_mel, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_loss_stft", loss_stft, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+
+        # =========================================================
+        # 🎨 [画图直传黑科技] 只有第 0 个 Batch 才把数据拷回 CPU 供画图使用
+        # =========================================================
+        ret = {"val_loss": val_loss}
+        if batch_idx == 0:
+            ret["viz_dirty"] = dirty_audio[:6].detach().cpu()
+            ret["viz_clean"] = clean_audio[:6].detach().cpu()
+            ret["viz_pred_mel"] = estimation[:6].detach().cpu()
+            
+        return ret
 
     def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
         """计算梯度范数（每 100 步采样，降低开销）"""
@@ -1524,8 +1670,8 @@ def main():
     # =================================================================
     model = ConcreteVoiceFixer(hp, channels=1, type_target="vocals")
 
-    # 👇 填入你最新跑完的 0.58 那个 ckpt 文件！
-    latest_ckpt_path = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_21/checkpoints/last.ckpt" 
+    # 👇 填入你最新跑完的那个 ckpt 文件！
+    latest_ckpt_path = "/root/autodl-tmp/myvoicefixer/logs/train_concrete/version_25/checkpoints/ultimate_stage3_epoch=209-step=59639.ckpt" 
 
     if os.path.exists(latest_ckpt_path):
         print(f"\n🔥 [Warm Start] 正在暴力加载满级权重: {latest_ckpt_path}")
@@ -1562,6 +1708,11 @@ def main():
         "num_sanity_val_steps": hp["train"].get("num_sanity_val_steps", 2),
         "val_check_interval": hp["train"].get("val_check_interval", 1.0),
         "log_every_n_steps": hp.get("log", {}).get("log_every_n_steps", 50),
+        
+        # =========================================================
+        # 🚀 新增：控制跑验证集的频率 (从 json 的 train 块读取)
+        # =========================================================
+        "check_val_every_n_epoch": hp["train"].get("check_val_every_n_epoch", 10), 
     }
 
     # 精度动态判断
@@ -1602,12 +1753,20 @@ def main():
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         ModelCheckpoint(
-            filename="ultimate_stage3_{epoch}-{step}-{val_loss:.4f}",
+            # 去掉文件名里的 val_loss，因为我们不再看它了
+            filename="ultimate_stage3_{epoch}-{step}",
             dirpath=os.path.join(logger.log_dir, "checkpoints"),
-            save_top_k=hp["train"].get("save_top_k", 3),
-            monitor="val_loss",
-            mode="min",
-            save_last=True,
+            
+            # ==========================================
+            # 🚀 核心修改区
+            # ==========================================
+            every_n_epochs=30,   # 👈 强制每 50 个 Epoch 存一个档（你可以改成 20 或 30）
+            save_top_k=-1,       # 👈 -1 表示“我全都要”，绝不自动删除任何一个档
+            
+            # 删除了 monitor="val_loss" 和 mode="min"
+            # ==========================================
+            
+            save_last=True,      # 依然保留最后一步的 last.ckpt 以防意外中断
         ),
         EarlyStopping(
             monitor="val_loss",
@@ -1622,8 +1781,12 @@ def main():
             hop_length=hp.get("mel", {}).get("hop_length", 441),
             n_mels=hp.get("mel", {}).get("n_mels", 128),
             max_samples=hp.get("log", {}).get("visual_max_samples", 6),
-            log_every_n_epochs=1,
-            vocoder_every_n_epochs=1,
+            
+            # =========================================================
+            # 🚀 修改：不再是每 1 个 Epoch 强制画图和跑声码器，改为从 json 读取
+            # =========================================================
+            log_every_n_epochs=hp.get("log", {}).get("visual_every_n_epochs", 10),
+            vocoder_every_n_epochs=hp.get("log", {}).get("visual_every_n_epochs", 10),
         ),
     ]
 
