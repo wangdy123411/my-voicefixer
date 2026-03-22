@@ -72,14 +72,14 @@
     "train": {
         "_doc": "基于双卡 4090 优化，若 OOM 请将 batch_size 减半",
         "max_epoches": 1010,
-        "batch_size": 24,
-        "accumulate_grad_batches": 3,
+        "batch_size": 72,
+        "accumulate_grad_batches": 1,
         "learning_rate": 8e-5,
         "lr_decay": 0.999,
         "warmup_steps": 1000,
         "input_segment_length": 132300,
         "reduce_lr_every_n_steps": 5000,
-        "check_val_every_n_epoch": 10,
+        "check_val_every_n_epoch": 2,
         "num_workers": 12,
         "pin_memory": true,
         "persistent_workers": true,
@@ -94,7 +94,7 @@
         "progress_bar_refresh_rate": 10,
         "log_every_n_steps": 50,
         "visual_max_samples": 6,
-        "visual_every_n_epochs": 10
+        "visual_every_n_epochs": 2
     },
 
     "concrete": {
